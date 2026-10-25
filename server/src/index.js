@@ -10,7 +10,7 @@ import mongoose from 'mongoose'
 import nodemailer from 'nodemailer'
 
 // Use reliable public DNS servers for MongoDB Atlas SRV resolution.
-const mongoDnsServers = String(process.env.MONGODB_DNS_SERVERS || '8.8.8.8,1.1.1.1')
+const mongoDnsServers = String(process.env.MONGODB_DNS_SERVERS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean)
@@ -48,11 +48,50 @@ app.use(cors({ origin(origin, callback) {
   if (!origin || allowedOrigins.has(origin)) return callback(null, true)
   return callback(new Error('CORS origin is not allowed.'))
 }, credentials: true, methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }))
-app.use(express.json({ limit: '1mb' }))
+app.disable('x-powered-by')
+app.set('trust proxy', IS_PRODUCTION ? 1 : false)
+app.use((req,res,next)=>{if(req.path.startsWith('/api/'))res.set('Cache-Control','no-store');next()})
+app.use((req,res,next)=>{res.set({'X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','X-Frame-Options':'DENY','Permissions-Policy':'camera=(), microphone=(), geolocation=()'});next()})
+// Razorpay signs the exact raw request bytes; register this route before JSON parsing.
+app.post('/api/payments/webhook', express.raw({type:'application/json',limit:'256kb'}), async (req,res) => {
+  try {
+    const secret=process.env.RAZORPAY_WEBHOOK_SECRET
+    if(!secret)return res.status(503).json({message:'Webhook not configured'})
+    const signature=String(req.get('x-razorpay-signature')||'')
+    const expected=crypto.createHmac('sha256',secret).update(req.body).digest('hex')
+    if(!/^[a-f0-9]{64}$/i.test(signature)||!crypto.timingSafeEqual(Buffer.from(signature,'hex'),Buffer.from(expected,'hex')))return res.sendStatus(401)
+    const event=JSON.parse(req.body.toString('utf8'))
+    const eventId=String(req.get('x-razorpay-event-id')||'')
+    if(!eventId||eventId.length>160)return res.sendStatus(400)
+    if(!['payment.captured','order.paid'].includes(event.event))return res.sendStatus(200)
+    const payment=event.payload?.payment?.entity
+    const rpOrderId=String(payment?.order_id||event.payload?.order?.entity?.id||'')
+    if(!rpOrderId)return res.sendStatus(200)
+    const booking=await Order.findOne({razorpayOrderId:rpOrderId})
+    if(!booking)return res.sendStatus(503) // retry if order has not yet been persisted
+    if(booking.paymentStatus==='paid')return res.sendStatus(200)
+    // Always fetch payment from Razorpay before updating state; never trust event totals alone.
+    if(!process.env.RAZORPAY_KEY_ID||!process.env.RAZORPAY_KEY_SECRET)return res.sendStatus(503)
+    const rp=new Razorpay({key_id:process.env.RAZORPAY_KEY_ID,key_secret:process.env.RAZORPAY_KEY_SECRET})
+    const paymentId=String(payment?.id||'')
+    if(!paymentId)return res.sendStatus(503)
+    const verified=await rp.payments.fetch(paymentId)
+    if(verified.status!=='captured'||verified.order_id!==rpOrderId||verified.amount!==Math.round(Number(booking.total)*100)||verified.currency!=='INR')return res.sendStatus(409)
+    const updated=await Order.findOneAndUpdate({_id:booking._id,paymentStatus:{$ne:'paid'}},{$set:{paymentStatus:'paid',paymentMethod:verified.method||'razorpay',razorpayPaymentId:paymentId,paidAt:new Date(),status:'confirmed',serviceStatus:'allocated',allocatedAt:new Date()}},{new:true})
+    if(updated)await autoAssignDeliveryIfEligible(updated)
+    return res.sendStatus(200)
+  }catch(error){console.error('Payment webhook processing failed:',error.message);return res.sendStatus(500)}
+})
+app.use(express.json({ limit: '256kb', strict: true }))
+app.use('/api', (req,res,next)=>{
+  if (['POST','PUT','PATCH'].includes(req.method) && req.is('application/json') && (!req.body || typeof req.body !== 'object' || Array.isArray(req.body))) return res.status(400).json({message:'Expected a JSON object.'})
+  next()
+})
 
 // Lightweight per-process protection for auth endpoints. For multi-instance production,
 // use a shared Redis-backed limiter at the edge/API gateway as well.
 const rateBuckets = new Map()
+const RATE_BUCKET_LIMIT = 20000
 function rateLimit({ windowMs = 15 * 60 * 1000, max = 20 } = {}) {
   return (req, res, next) => {
     const now = Date.now(), key = `${req.ip}:${req.path}`
@@ -60,7 +99,7 @@ function rateLimit({ windowMs = 15 * 60 * 1000, max = 20 } = {}) {
     if (!entry || now >= entry.resetAt) { entry = { count: 0, resetAt: now + windowMs }; rateBuckets.set(key, entry) }
     entry.count += 1
     if (entry.count > max) { res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000))); return res.status(429).json({ message: 'Too many attempts. Please try again later.' }) }
-    if (rateBuckets.size > 10000) for (const [k, v] of rateBuckets) if (now >= v.resetAt) rateBuckets.delete(k)
+    if (rateBuckets.size > RATE_BUCKET_LIMIT) { for (const [k, v] of rateBuckets) if (now >= v.resetAt) rateBuckets.delete(k); if (rateBuckets.size > RATE_BUCKET_LIMIT) rateBuckets.clear() }
     next()
   }
 }
@@ -79,7 +118,7 @@ const defaultMenu = {
   deliverySettings: {autoAssignSingle:true,bootstrapInitialized:false},
   serviceAddresses: {
     tiffin:'Star Plaza, Pahadpur, Kanchan Bihari Marg',
-    press:'Near Firoz Hostel, opposite Integral University Gate No. 2, Kursi Road 22826'
+    press:'Near She rose Hostel, opposite Integral University Gate No. 2, Kursi Road 22826'
   },
   preBooking: {
     enabled:false,
@@ -152,7 +191,16 @@ const orderSchema = new mongoose.Schema({
   razorpayOrderId:String,razorpayPaymentId:String,paidAt:Date,serviceStatus:{type:String,default:'pending'},allocatedAt:Date,
   allocationCode:String,preBooking:{type:Boolean,default:false},offerTitle:String,offerDescription:String,offerStatus:{type:String,default:'none'},offerAvailableAt:Date,offerExpiresAt:Date,offerClaimedAt:Date,referralCode:String,referralOfferTitle:String,referralOfferDescription:String,referralOffer:{type:Boolean,default:false},referralOfferStatus:{type:String,default:'none'},referralOfferType:String,referralOfferValue:{type:Number,default:0},referralDiscount:{type:Number,default:0},referralOfferClaimedAt:Date,pauseRequests:[{startDate:String,endDate:String,days:Number,status:{type:String,default:'pending'},requestedAt:{type:Date,default:Date.now},approvedAt:Date,rejectedAt:Date}],servicePaused:{type:Boolean,default:false},servicePauseStart:String,servicePauseEnd:String,paymentDueStartDay:Number,paymentDueEndDay:Number,usePressOffer:{type:Boolean,default:false},pressOfferUsed:{type:Boolean,default:false},deliveryPartnerId:String,deliveryAssignedAt:Date,deliveryStatus:{type:String,default:'unassigned'}
 },{timestamps:true})
+// Query indexes for the busiest student/admin screens.
+orderSchema.index({userId:1,createdAt:-1})
+orderSchema.index({paymentStatus:1,createdAt:-1})
+orderSchema.index({service:1,date:1,paymentStatus:1})
+orderSchema.index({deliveryPartnerId:1,deliveryStatus:1})
 const Order = mongoose.model('Order', orderSchema)
+const scheduleSchema=new mongoose.Schema({date:{type:String,required:true},plan:{type:String,enum:['standard','premium'],required:true},meals:{type:mongoose.Schema.Types.Mixed,default:{}},enabled:{type:Boolean,default:true}},{timestamps:true})
+scheduleSchema.index({date:1,plan:1},{unique:true})
+const MenuSchedule=mongoose.model('MenuSchedule',scheduleSchema)
+
 const reviewSchema = new mongoose.Schema({userId:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true,index:true},name:String,service:{type:String,enum:['tiffin','party','laundry'],default:'tiffin',index:true},rating:{type:Number,min:1,max:5,required:true},comment:{type:String,required:true,trim:true},verified:{type:Boolean,default:false}},{timestamps:true})
 const Review = mongoose.model('Review', reviewSchema)
 const feedbackSchema = new mongoose.Schema({userId:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true},name:String,email:String,type:String,message:{type:String,required:true}},{timestamps:true})
@@ -435,7 +483,40 @@ app.get('/api/admin/reviews',auth,adminOnly,async(_,res,next)=>{try{res.json(awa
 app.put('/api/admin/reviews/:id',auth,adminOnly,async(req,res,next)=>{try{const rating=Number(req.body?.rating);const comment=String(req.body?.comment||'').trim();const service=['tiffin','party','laundry'].includes(req.body?.service)?req.body.service:'tiffin';if(!Number.isInteger(rating)||rating<1||rating>5)return res.status(400).json({message:'Choose a rating from 1 to 5.'});if(comment.length<3||comment.length>1000)return res.status(400).json({message:'Review must be between 3 and 1000 characters.'});const r=await Review.findByIdAndUpdate(req.params.id,{rating,comment,service},{new:true,runValidators:true}).populate('userId','name email');if(!r)return res.status(404).json({message:'Review not found.'});res.json(r)}catch(e){next(e)}})
 app.post('/api/admin/notifications/unpaid',auth,adminOnly,async(_,res,next)=>{try{const transport=mailer();if(!transport)return res.status(503).json({message:'Email notifications are not configured. Add SMTP_HOST, SMTP_USER and SMTP_PASS to server/.env.'});const pending=await Order.find({paymentStatus:{$ne:'paid'},status:{$nin:['cancelled','delivered']}}).populate('userId','name email');const unique=new Map();for(const o of pending){const email=o.userId?.email;if(email&&!unique.has(email))unique.set(email,{name:o.userId.name,email,orders:[]});if(email)unique.get(email).orders.push(o)}const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));let sent=0;for(const customer of unique.values()){const orderLines=customer.orders.map(o=>`• ${o.orderId} — ₹${Number(o.total||0).toLocaleString('en-IN')} — ${o.service}`).join('\n');const htmlOrders=customer.orders.map(o=>{const payUrl=`${PUBLIC_APP_URL}/account?tab=orders&pay=${encodeURIComponent(o.orderId)}`;return `<div style=\"margin:0 0 18px;padding:16px 18px;border:1px solid #dfe4ec;border-radius:12px;background:#ffffff;\"><div style=\"font-weight:700;font-size:16px;color:#101828;\">${esc(o.orderId)}</div><div style=\"margin-top:6px;color:#667085;\">${esc(o.service)} · <strong style=\"color:#101828;\">₹${Number(o.total||0).toLocaleString('en-IN')}</strong></div><a href=\"${esc(payUrl)}\" style=\"display:inline-block;margin-top:14px;padding:11px 18px;background:#0d1b3e;color:#ffffff;text-decoration:none;border-radius:7px;font-weight:700;\">Pay Now</a><div style=\"margin-top:10px;font-size:12px;color:#667085;word-break:break-all;\">Payment link: ${esc(payUrl)}</div></div>`}).join('');const subject=customer.orders.length===1?`Payment Reminder | Tiffin Wallah | ${customer.orders[0].orderId}`:'Payment Reminder | Tiffin Wallah';const payText=customer.orders.map(o=>`${o.orderId} — ₹${Number(o.total||0).toLocaleString('en-IN')} — ${o.service}\nPay securely: ${PUBLIC_APP_URL}/account?tab=orders&pay=${encodeURIComponent(o.orderId)}`).join('\n\n');const text=`Dear ${customer.name||'Customer'},\n\nThis is a formal reminder from Tiffin Wallah regarding your pending payment.\n\nOur records show that the following order(s) are awaiting payment:\n\n${orderLines}\n\nPlease complete the payment at your earliest convenience so that we can confirm your order and allocate the requested service. Your order will remain pending until the payment is successfully verified.\n\nPAYMENT LINK\n${payText}\n\nIf you have already completed the payment, please disregard this message. If the payment was completed but your order still shows as pending, open your account and use the Check Payment option.\n\nFor any assistance, please contact Tiffin Wallah support.\n\nRegards,\nTiffin Wallah\nFresh food. Made with care. Delivered on time.`;const html=`<div style=\"font-family:Arial,Helvetica,sans-serif;background:#f5f7fa;padding:32px 16px;color:#101828;\"><div style=\"max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e4e7ec;border-radius:16px;overflow:hidden;\"><div style=\"background:#0d1b3e;padding:24px 28px;color:#ffffff;\"><div style=\"font-size:12px;letter-spacing:2px;font-weight:700;\">TIFFIN WALLAH</div><h1 style=\"margin:10px 0 0;font-size:28px;\">Payment Reminder</h1></div><div style=\"padding:28px;\"><p style=\"font-size:16px;\">Dear ${esc(customer.name||'Customer')},</p><p style=\"line-height:1.6;color:#475467;\">This is a formal reminder regarding your pending Tiffin Wallah payment. Our records show that the following order(s) are awaiting payment.</p>${htmlOrders}<p style=\"line-height:1.6;color:#475467;\">Please complete the payment at your earliest convenience so that we can confirm your order and allocate the requested service. Your order will remain pending until the payment is successfully verified.</p><p style=\"line-height:1.6;color:#475467;\">If you have already completed the payment, please disregard this message. If your payment was completed but the order still shows as pending, open your account and use <strong>Check Payment</strong>.</p><p style=\"margin-top:28px;line-height:1.6;color:#475467;\">For any assistance, please contact Tiffin Wallah support.</p><p style=\"margin-bottom:0;\">Regards,<br><strong>Tiffin Wallah</strong><br><span style=\"color:#667085;\">Fresh food. Made with care. Delivered on time.</span></p></div></div></div>`;await transport.sendMail({from:process.env.SMTP_FROM||process.env.SMTP_USER,to:customer.email,subject,text,html});sent++}res.json({message:`Formal payment reminder sent to ${sent} customer${sent===1?'':'s'}. Each reminder includes a Pay Now link.`,sent,pendingOrders:pending.length})}catch(e){next(e)}})
 
-app.use((err,req,res,_next)=>{if(err?.message==='CORS origin is not allowed.')return res.status(403).json({message:'This website origin is not allowed to access the API.'});console.error(`[API] ${req.method} ${req.path}`,err);if(err?.code===11000)return res.status(409).json({message:'This record already exists.'});if(err?.name==='ValidationError')return res.status(400).json({message:Object.values(err.errors).map(x=>x.message).join(', ')});res.status(500).json({message:process.env.NODE_ENV==='production'?'Server error. Please try again.':err.message||'Server error.'})})
+// Date-specific menu overrides; legacy weekly menus remain the fallback.
+app.get('/api/menu/schedule',async(req,res,next)=>{try{
+  const from=String(req.query.from||'').slice(0,10),to=String(req.query.to||'').slice(0,10)
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(from)||!/^\d{4}-\d{2}-\d{2}$/.test(to)||to<from)return res.status(400).json({message:'Valid from/to dates required'})
+  const rows=await MenuSchedule.find({date:{$gte:from,$lte:to},enabled:true}).sort({date:1}).limit(124).lean()
+  res.json(rows)
+}catch(e){next(e)}})
+app.put('/api/admin/menu/schedule',auth,adminOnly,async(req,res,next)=>{try{
+  const {date,plan,meals,enabled=true}=req.body||{}
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(String(date))||!Number.isFinite(Date.parse(date+'T00:00:00Z'))||!['standard','premium'].includes(plan)||!meals||typeof meals!=='object'||Array.isArray(meals))return res.status(400).json({message:'Valid date, plan and meals are required'})
+  const cleaned={};for(const slot of ['morning','lunch','dinner'])if(meals[slot]?.name){cleaned[slot]={name:String(meals[slot].name).trim().slice(0,160)}}
+  if(!Object.keys(cleaned).length)return res.status(400).json({message:'At least one meal is required'})
+  const result=await MenuSchedule.findOneAndUpdate({date,plan},{$set:{meals:cleaned,enabled:enabled===true}},{upsert:true,new:true,runValidators:true})
+  res.json(result)
+}catch(e){next(e)}})
+app.get('/api/subscriptions/calendar',auth,async(req,res,next)=>{try{
+  const month=String(req.query.month||new Date().toISOString().slice(0,7))
+  if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month))return res.status(400).json({message:'Invalid month'})
+  const start=month+'-01',end=new Date(Date.UTC(Number(month.slice(0,4)),Number(month.slice(5,7)),0)).toISOString().slice(0,10)
+  const orders=await Order.find({userId:req.user.id,service:'monthly-tiffin',paymentStatus:'paid'}).select('orderId date plan status pauseRequests servicePaused servicePauseStart servicePauseEnd createdAt').lean()
+  const days=[];for(let n=1;n<=Number(end.slice(8));n++){
+    const date=month+'-'+String(n).padStart(2,'0')
+    const meals=orders.filter(o=>{const begin=o.date||o.createdAt?.toISOString().slice(0,10);if(!begin||date<begin)return false;const until=new Date(begin+'T00:00:00Z');until.setUTCDate(until.getUTCDate()+29);return date<=until.toISOString().slice(0,10)}).map(o=>({orderId:o.orderId,plan:o.plan,status:(o.pauseRequests||[]).some(r=>r.status==='approved'&&date>=r.startDate&&date<=r.endDate)?'paused':o.status==='delivered'?'delivered':'scheduled'}))
+    days.push({date,meals})
+  }
+  res.json({month,days,notice:'Calendar uses a 30-day subscription window; individual daily delivery confirmations require separate meal records.'})
+}catch(e){next(e)}})
+app.get('/api/admin/orders/live',auth,adminOnly,async(req,res,next)=>{try{
+  const page=Math.min(10000,Math.max(1,Number.parseInt(req.query.page,10)||1)),limit=30
+  const status=String(req.query.status||'');const filter=status?{status:{$in:['awaiting-payment','confirmed','preparing','packed','out-for-delivery','delivered','cancelled'].includes(status)?[status]:[]}}:{}
+  const [orders,total]=await Promise.all([Order.find(filter).select('orderId service plan status paymentStatus total date createdAt deliveryStatus userId').sort({createdAt:-1}).skip((page-1)*limit).limit(limit).populate('userId','name phone').lean(),Order.countDocuments(filter)])
+  res.json({orders,total,page,pages:Math.ceil(total/limit)})
+}catch(e){next(e)}})
+app.use((err,req,res,_next)=>{if(err?.message==='CORS origin is not allowed.')return res.status(403).json({message:'This website origin is not allowed to access the API.'});console.error(`[API] ${req.method} ${req.path}`,err);if(err?.code===11000)return res.status(409).json({message:'This record already exists.'});if(err?.type==='entity.too.large')return res.status(413).json({message:'Request payload too large.'});if(err instanceof SyntaxError && err.status===400 && 'body' in err)return res.status(400).json({message:'Invalid JSON request.'});if(err?.name==='ValidationError')return res.status(400).json({message:Object.values(err.errors).map(x=>x.message).join(', ')});res.status(500).json({message:process.env.NODE_ENV==='production'?'Server error. Please try again.':err.message||'Server error.'})})
 
 async function start(){
   if(!MONGODB_URI){console.error('MONGODB_URI is missing. Create server/.env from .env.example and add your MongoDB URI.');process.exit(1)}

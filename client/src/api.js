@@ -75,3 +75,8 @@ export const deleteDeliveryPartner = id => request(`/admin/delivery-partners/${e
 export const getDeliverySettings = () => request('/admin/delivery-settings')
 export const updateDeliverySettings = payload => request('/admin/delivery-settings',{method:'PUT',body:JSON.stringify(payload)})
 export const autoDivideDeliveries = () => request('/admin/delivery/auto-divide',{method:'POST',body:JSON.stringify({})})
+
+export const getSubscriptionCalendar = month => request(`/subscriptions/calendar?month=${encodeURIComponent(month)}`)
+export const getScheduledMenus = (from,to) => request(`/menu/schedule?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`)
+export const saveScheduledMenu = payload => request('/admin/menu/schedule',{method:'PUT',body:JSON.stringify(payload)})
+export const getLiveOrders = (page=1) => request(`/admin/orders/live?page=${page}`)

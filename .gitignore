@@ -1,12 +1,11 @@
 node_modules/
-dist/
 .env
-*.log
 .env.*
 !.env.example
+!.env.sample
+dist/
 build/
 coverage/
-
-# Local reference files excluded from deployment
-/App_part.txt
-/server_part.txt
+*.pem
+*.key
+*.log
