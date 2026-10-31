@@ -1,0 +1,551 @@
+import 'dotenv/config'
+import dns from 'node:dns'
+import express from 'express'
+import cors from 'cors'
+import crypto from 'crypto'
+import bcrypt from 'bcryptjs'
+import jwt from 'jsonwebtoken'
+import Razorpay from 'razorpay'
+import mongoose from 'mongoose'
+import nodemailer from 'nodemailer'
+
+// Use reliable public DNS servers for MongoDB Atlas SRV resolution.
+const mongoDnsServers = String(process.env.MONGODB_DNS_SERVERS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean)
+if (mongoDnsServers.length) dns.setServers(mongoDnsServers)
+
+const app = express()
+const PORT = Number(process.env.PORT || 5000)
+const MONGODB_URI = String(process.env.MONGODB_URI || '').trim()
+const IS_PRODUCTION = process.env.NODE_ENV === 'production'
+const JWT_SECRET = String(process.env.JWT_SECRET || (IS_PRODUCTION ? '' : 'local-development-only-change-this-secret'))
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || (IS_PRODUCTION ? '' : 'admin@tiffinwallah.local')).trim().toLowerCase()
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || (IS_PRODUCTION ? '' : 'LocalAdmin@12345'))
+const CLIENT_URL = String(process.env.CLIENT_URL || (IS_PRODUCTION ? '' : 'http://localhost:5173')).trim().replace(/\/$/, '')
+const PUBLIC_APP_URL = (process.env.PUBLIC_APP_URL || CLIENT_URL).replace(/\/$/, '')
+const DELIVERY_PARTNER_ID = String(process.env.DELIVERY_PARTNER_ID || 'TWDEL001').trim().toUpperCase()
+const DELIVERY_PARTNER_PASSWORD = String(process.env.DELIVERY_PARTNER_PASSWORD || (IS_PRODUCTION ? '' : 'LocalDelivery@12345')).trim()
+
+// Fail closed in production instead of silently using public/default credentials.
+if (IS_PRODUCTION) {
+  const missing = []
+  if (JWT_SECRET.length < 32) missing.push('JWT_SECRET (at least 32 characters)')
+  if (!ADMIN_EMAIL) missing.push('ADMIN_EMAIL')
+  if (!CLIENT_URL || !/^https:\/\//i.test(CLIENT_URL)) missing.push('CLIENT_URL (HTTPS production frontend origin)')
+  if (ADMIN_PASSWORD.length < 12) missing.push('ADMIN_PASSWORD (at least 12 characters)')
+  if (!DELIVERY_PARTNER_PASSWORD || DELIVERY_PARTNER_PASSWORD.length < 12) missing.push('DELIVERY_PARTNER_PASSWORD (at least 12 characters)')
+  if (missing.length) throw new Error(`Missing/weak production configuration: ${missing.join(', ')}`)
+}
+
+const normalizeOrigin = value => { try { const u = new URL(String(value).trim()); return u.origin } catch { return '' } }
+const configuredOrigins = [CLIENT_URL, ...(process.env.ALLOWED_ORIGINS || '').split(',')].map(normalizeOrigin).filter(Boolean)
+if (IS_PRODUCTION && configuredOrigins.some(origin => /^https?:\/\/(localhost|127\.0\.0\.1)(:|$)/i.test(origin))) throw new Error('Localhost origins are not allowed in production CORS configuration.')
+const allowedOrigins = new Set(configuredOrigins)
+if (!IS_PRODUCTION) { allowedOrigins.add('http://localhost:5173'); allowedOrigins.add('http://localhost:5174'); allowedOrigins.add('http://127.0.0.1:5173') }
+app.use(cors({ origin(origin, callback) {
+  if (!origin || allowedOrigins.has(origin)) return callback(null, true)
+  return callback(new Error('CORS origin is not allowed.'))
+}, credentials: true, methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }))
+app.disable('x-powered-by')
+app.set('trust proxy', IS_PRODUCTION ? 1 : false)
+app.use((req,res,next)=>{if(req.path.startsWith('/api/'))res.set('Cache-Control','no-store');next()})
+app.use((req,res,next)=>{res.set({'X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','X-Frame-Options':'DENY','Permissions-Policy':'camera=(), microphone=(), geolocation=()'});next()})
+// Razorpay signs the exact raw request bytes; register this route before JSON parsing.
+app.post('/api/payments/webhook', express.raw({type:'application/json',limit:'256kb'}), async (req,res) => {
+  try {
+    const secret=process.env.RAZORPAY_WEBHOOK_SECRET
+    if(!secret)return res.status(503).json({message:'Webhook not configured'})
+    const signature=String(req.get('x-razorpay-signature')||'')
+    const expected=crypto.createHmac('sha256',secret).update(req.body).digest('hex')
+    if(!/^[a-f0-9]{64}$/i.test(signature)||!crypto.timingSafeEqual(Buffer.from(signature,'hex'),Buffer.from(expected,'hex')))return res.sendStatus(401)
+    const event=JSON.parse(req.body.toString('utf8'))
+    const eventId=String(req.get('x-razorpay-event-id')||'')
+    if(!eventId||eventId.length>160)return res.sendStatus(400)
+    if(!['payment.captured','order.paid'].includes(event.event))return res.sendStatus(200)
+    const payment=event.payload?.payment?.entity
+    const rpOrderId=String(payment?.order_id||event.payload?.order?.entity?.id||'')
+    if(!rpOrderId)return res.sendStatus(200)
+    const booking=await Order.findOne({razorpayOrderId:rpOrderId})
+    if(!booking)return res.sendStatus(503) // retry if order has not yet been persisted
+    if(booking.paymentStatus==='paid')return res.sendStatus(200)
+    // Always fetch payment from Razorpay before updating state; never trust event totals alone.
+    if(!process.env.RAZORPAY_KEY_ID||!process.env.RAZORPAY_KEY_SECRET)return res.sendStatus(503)
+    const rp=new Razorpay({key_id:process.env.RAZORPAY_KEY_ID,key_secret:process.env.RAZORPAY_KEY_SECRET})
+    const paymentId=String(payment?.id||'')
+    if(!paymentId)return res.sendStatus(503)
+    const verified=await rp.payments.fetch(paymentId)
+    if(verified.status!=='captured'||verified.order_id!==rpOrderId||verified.amount!==Math.round(Number(booking.total)*100)||verified.currency!=='INR')return res.sendStatus(409)
+    const updated=await Order.findOneAndUpdate({_id:booking._id,paymentStatus:{$ne:'paid'}},{$set:{paymentStatus:'paid',paymentMethod:verified.method||'razorpay',razorpayPaymentId:paymentId,paidAt:new Date(),status:'confirmed',serviceStatus:'allocated',allocatedAt:new Date()}},{new:true})
+    if(updated)await autoAssignDeliveryIfEligible(updated)
+    return res.sendStatus(200)
+  }catch(error){console.error('Payment webhook processing failed:',error.message);return res.sendStatus(500)}
+})
+app.use(express.json({ limit: '256kb', strict: true }))
+app.use('/api', (req,res,next)=>{
+  if (['POST','PUT','PATCH'].includes(req.method) && req.is('application/json') && (!req.body || typeof req.body !== 'object' || Array.isArray(req.body))) return res.status(400).json({message:'Expected a JSON object.'})
+  next()
+})
+
+// Lightweight per-process protection for auth endpoints. For multi-instance production,
+// use a shared Redis-backed limiter at the edge/API gateway as well.
+const rateBuckets = new Map()
+const RATE_BUCKET_LIMIT = 20000
+function rateLimit({ windowMs = 15 * 60 * 1000, max = 20 } = {}) {
+  return (req, res, next) => {
+    const now = Date.now(), key = `${req.ip}:${req.path}`
+    let entry = rateBuckets.get(key)
+    if (!entry || now >= entry.resetAt) { entry = { count: 0, resetAt: now + windowMs }; rateBuckets.set(key, entry) }
+    entry.count += 1
+    if (entry.count > max) { res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000))); return res.status(429).json({ message: 'Too many attempts. Please try again later.' }) }
+    if (rateBuckets.size > RATE_BUCKET_LIMIT) { for (const [k, v] of rateBuckets) if (now >= v.resetAt) rateBuckets.delete(k); if (rateBuckets.size > RATE_BUCKET_LIMIT) rateBuckets.clear() }
+    next()
+  }
+}
+const authRateLimit = rateLimit({ max: 30 })
+const passwordRateLimit = rateLimit({ max: 8 })
+const days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+
+const defaultMenu = {
+  key: 'main', monthlyPrice: 4500, laundryEnabled: true, premiumMorningEnabled:true, additionalFoods:[{id:'extra-paneer',name:'Paneer Curry Extra',price:80,description:'Extra serving of paneer curry',enabled:true},{id:'extra-roti',name:'Extra Roti',price:10,description:'Fresh roti',enabled:true},{id:'extra-rice',name:'Extra Jeera Rice',price:50,description:'Extra serving of jeera rice',enabled:true}],
+  monthlyPlans: [
+    {id:'standard',name:'Standard Tiffin',price:4500,description:'A balanced monthly homestyle tiffin plan with hygienic daily meals.'},
+    {id:'premium',name:'Premium Tiffin',price:6000,description:'A premium monthly plan with upgraded menu choices and premium meal options.'}
+  ],
+  paymentWindow: {startDay:1,endDay:5},
+  referral: {enabled:true,code:'TWFREEPRESS',title:'Free Press Wallah Offer',description:'Use this referral code to unlock one complimentary Press Wallah service.',offerType:'free-press',value:0,service:'laundry-free',expiresAt:'',oneUsePerCustomer:true},
+  deliverySettings: {autoAssignSingle:true,bootstrapInitialized:false},
+  serviceAddresses: {
+    tiffin:'Star Plaza, Pahadpur, Kanchan Bihari Marg',
+    press:'Near She rose Hostel, opposite Integral University Gate No. 2, Kursi Road 22826'
+  },
+  preBooking: {
+    enabled:false,
+    offerTitle:'Free Laundry Offer',
+    offerDescription:'Book your monthly tiffin in advance and unlock one complimentary laundry service after 15 days.',
+    offerService:'laundry-free',
+    claimAfterDays:15,
+    expiresAfterMonths:2
+  },
+  rulesBook: [
+    'Orders are confirmed only after successful payment verification.',
+    'Monthly tiffin services are available under Standard and Premium plans.',
+    'Customers must keep their delivery address and phone number updated.',
+    'Pre-booking offers can be claimed after the eligibility period shown at booking.',
+    'An offer expires automatically after the configured validity period.',
+    'Laundry pickup and delivery times are subject to service availability.',
+    'Party bookings require the selected guest count, event date and address.',
+    'Service availability, menu and prices may be updated by the administrator.'
+  ],
+  daily: [],
+  weekly: Object.fromEntries(days.map((day, i) => [day, {
+    morning:{name:['Poha + Tea','Aloo Paratha + Curd','Idli + Sambar','Veg Sandwich + Tea','Upma + Fruit','Chole Bhature','Masala Dosa + Chutney'][i]},
+    lunch:{name:['Dal Tadka + Roti + Rice','Rajma Rice + Salad','Kadhi Pakora + Roti','Chole + Jeera Rice','Dal Makhani + Roti','Veg Biryani + Raita','Paneer Curry + Roti'][i]},
+    dinner:{name:['Mix Veg + Dal + Roti','Paneer Masala + Roti','Aloo Gobi + Dal + Roti','Kofta Curry + Roti','Matar Paneer + Rice','Dal Fry + Jeera Rice','Seasonal Veg + Dal + Roti'][i]}
+  }])),
+  party: { pricePerPlate:800, minGuests:1, packages:[
+    {id:'standard',name:'Standard Party',description:'A dependable party menu with homestyle favourites.',price:800},
+    {id:'premium',name:'Premium Party',description:'A richer party menu with premium starters and mains.',price:1000}
+  ],
+  starters:[{id:'starter-paneer',name:'Paneer Tikka',pricePerPlate:40},{id:'starter-kebab',name:'Veg Seekh Kebab',pricePerPlate:45}],
+  mainCourse:[{id:'main-paneer',name:'Paneer Butter Masala',pricePerPlate:55},{id:'main-dal',name:'Dal Tadka',pricePerPlate:25},{id:'main-mixveg',name:'Seasonal Mix Veg',pricePerPlate:30}],
+  breadsRice:[{id:'bread-naan',name:'Butter Naan',pricePerPlate:20},{id:'bread-roti',name:'Tandoori Roti',pricePerPlate:10},{id:'rice-jeera',name:'Jeera Rice',pricePerPlate:25},{id:'rice-biryani',name:'Veg Biryani',pricePerPlate:45}],
+  desserts:[{id:'dessert-gulab',name:'Gulab Jamun',pricePerPlate:20},{id:'dessert-kheer',name:'Kheer',pricePerPlate:25}],
+  drinks:[{id:'drink-lassi',name:'Sweet Lassi',pricePerPlate:30},{id:'drink-juice',name:'Fresh Juice',pricePerPlate:35}] }
+}
+
+const cloneWeekly = source => JSON.parse(JSON.stringify(source))
+for (const plan of defaultMenu.monthlyPlans) {
+  plan.weekly = cloneWeekly(defaultMenu.weekly)
+  if (plan.id === 'standard') for (const day of days) delete plan.weekly[day].morning
+}
+for (const pkg of defaultMenu.party.packages) pkg.menu = {starters:JSON.parse(JSON.stringify(defaultMenu.party.starters)),mainCourse:JSON.parse(JSON.stringify(defaultMenu.party.mainCourse)),breadsRice:JSON.parse(JSON.stringify(defaultMenu.party.breadsRice)),desserts:JSON.parse(JSON.stringify(defaultMenu.party.desserts)),drinks:JSON.parse(JSON.stringify(defaultMenu.party.drinks))}
+
+const defaultLaundry = [
+  {id:'shirt',name:'Shirt / T-Shirt',prices:{wash:25,press:15,'wash-press':40}},
+  {id:'pants',name:'Pants / Trousers',prices:{wash:35,press:20,'wash-press':55}},
+  {id:'jeans',name:'Jeans',prices:{wash:45,press:25,'wash-press':70}},
+  {id:'kurta',name:'Kurta',prices:{wash:40,press:25,'wash-press':65}},
+  {id:'dress',name:'Dress',prices:{wash:55,press:35,'wash-press':90}},
+  {id:'bedsheet',name:'Bedsheet',prices:{wash:70,press:45,'wash-press':115}}
+]
+
+const userSchema = new mongoose.Schema({
+  name:{type:String,required:true,trim:true}, email:{type:String,required:true,unique:true,lowercase:true,trim:true,index:true}, phone:{type:String,default:''},
+  address:{type:String,default:''}, city:{type:String,default:''}, pincode:{type:String,default:''},
+  addresses:[{_id:{type:mongoose.Schema.Types.ObjectId,auto:true},label:{type:String,default:'Home'},address:{type:String,required:true},city:{type:String,required:true},pincode:{type:String,required:true},phone:{type:String,default:''},isDefault:{type:Boolean,default:false}}],
+  passwordHash:{type:String,required:true}, role:{type:String,enum:['customer','admin'],default:'customer',index:true},pressOfferCredits:{type:Number,default:0},
+  resetPasswordToken:{type:String,default:null,index:true}, resetPasswordExpires:{type:Date,default:null}
+},{timestamps:true})
+const User = mongoose.model('User', userSchema)
+const menuSchema = new mongoose.Schema({key:{type:String,unique:true,index:true},laundryEnabled:{type:Boolean,default:true},premiumMorningEnabled:{type:Boolean,default:true},additionalFoods:Array,monthlyPrice:Number,monthlyPlans:Array,paymentWindow:mongoose.Schema.Types.Mixed,referral:mongoose.Schema.Types.Mixed,deliverySettings:mongoose.Schema.Types.Mixed,serviceAddresses:mongoose.Schema.Types.Mixed,preBooking:mongoose.Schema.Types.Mixed,rulesBook:[String],daily:Array,weekly:mongoose.Schema.Types.Mixed,party:mongoose.Schema.Types.Mixed},{timestamps:true})
+const Menu = mongoose.model('Menu', menuSchema)
+const laundrySchema = new mongoose.Schema({key:{type:String,unique:true,index:true},items:Array},{timestamps:true})
+const Laundry = mongoose.model('Laundry', laundrySchema)
+const orderSchema = new mongoose.Schema({
+  orderId:{type:String,unique:true,index:true},userId:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true,index:true},
+  service:{type:String,required:true},plan:String,meal:String,mealName:String,day:String,quantity:Number,date:String,pickupDate:String,
+  guests:Number,time:String,eventType:String,packageId:String,packageName:String,notes:String,addressId:String,address:String,city:String,pincode:String,
+  selectedMenu:Array,addOns:Array,items:Array,total:{type:Number,required:true,min:0},status:{type:String,default:'awaiting-payment',index:true},paymentStatus:{type:String,default:'pending',index:true},paymentMethod:String,
+  razorpayOrderId:String,razorpayPaymentId:String,paidAt:Date,serviceStatus:{type:String,default:'pending'},allocatedAt:Date,
+  allocationCode:String,preBooking:{type:Boolean,default:false},offerTitle:String,offerDescription:String,offerStatus:{type:String,default:'none'},offerAvailableAt:Date,offerExpiresAt:Date,offerClaimedAt:Date,referralCode:String,referralOfferTitle:String,referralOfferDescription:String,referralOffer:{type:Boolean,default:false},referralOfferStatus:{type:String,default:'none'},referralOfferType:String,referralOfferValue:{type:Number,default:0},referralDiscount:{type:Number,default:0},referralOfferClaimedAt:Date,pauseRequests:[{startDate:String,endDate:String,days:Number,status:{type:String,default:'pending'},requestedAt:{type:Date,default:Date.now},approvedAt:Date,rejectedAt:Date}],servicePaused:{type:Boolean,default:false},servicePauseStart:String,servicePauseEnd:String,paymentDueStartDay:Number,paymentDueEndDay:Number,usePressOffer:{type:Boolean,default:false},pressOfferUsed:{type:Boolean,default:false},deliveryPartnerId:String,deliveryAssignedAt:Date,deliveryStatus:{type:String,default:'unassigned'}
+},{timestamps:true})
+// Query indexes for the busiest student/admin screens.
+orderSchema.index({userId:1,createdAt:-1})
+orderSchema.index({paymentStatus:1,createdAt:-1})
+orderSchema.index({service:1,date:1,paymentStatus:1})
+orderSchema.index({deliveryPartnerId:1,deliveryStatus:1})
+const Order = mongoose.model('Order', orderSchema)
+const scheduleSchema=new mongoose.Schema({date:{type:String,required:true},plan:{type:String,enum:['standard','premium'],required:true},meals:{type:mongoose.Schema.Types.Mixed,default:{}},enabled:{type:Boolean,default:true}},{timestamps:true})
+scheduleSchema.index({date:1,plan:1},{unique:true})
+const MenuSchedule=mongoose.model('MenuSchedule',scheduleSchema)
+
+const reviewSchema = new mongoose.Schema({userId:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true,index:true},name:String,service:{type:String,enum:['tiffin','party','laundry'],default:'tiffin',index:true},rating:{type:Number,min:1,max:5,required:true},comment:{type:String,required:true,trim:true},verified:{type:Boolean,default:false}},{timestamps:true})
+const Review = mongoose.model('Review', reviewSchema)
+
+const certificateSchema = new mongoose.Schema({title:{type:String,required:true,trim:true,maxlength:150},category:{type:String,required:true,trim:true,maxlength:60},issuer:{type:String,required:true,trim:true,maxlength:150},licenseNumber:{type:String,trim:true,maxlength:100},validUntil:{type:String,default:''},description:{type:String,trim:true,maxlength:1000},documentUrl:{type:String,required:true},published:{type:Boolean,default:true}},{timestamps:true})
+const Certificate = mongoose.model('Certificate',certificateSchema)
+
+const feedbackSchema = new mongoose.Schema({userId:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true},name:String,email:String,type:String,message:{type:String,required:true}},{timestamps:true})
+const Feedback = mongoose.model('Feedback', feedbackSchema)
+const deliveryPartnerSchema = new mongoose.Schema({
+  partnerId:{type:String,unique:true,index:true},name:{type:String,required:true,trim:true},phone:{type:String,default:''},passwordHash:{type:String,required:true},active:{type:Boolean,default:true,index:true},createdBy:{type:String,default:'env'}
+},{timestamps:true})
+const DeliveryPartner = mongoose.model('DeliveryPartner', deliveryPartnerSchema)
+
+const safeUser = u => ({id:String(u._id),name:u.name,email:u.email,phone:u.phone||'',address:u.address||'',city:u.city||'',pincode:u.pincode||'',addresses:(u.addresses||[]).map(a=>({id:String(a._id),label:a.label,address:a.address,city:a.city,pincode:a.pincode,phone:a.phone||'',isDefault:!!a.isDefault})),role:u.role,createdAt:u.createdAt,pressOfferCredits:Number(u.pressOfferCredits||0)})
+const tokenFor = u => jwt.sign({id:String(u._id),email:u.email,role:u.role,name:u.name},JWT_SECRET,{expiresIn:'7d'})
+function auth(req,res,next){const t=(req.headers.authorization||'').replace(/^Bearer\s+/i,'');if(!t)return res.status(401).json({message:'Please login first.'});try{req.user=jwt.verify(t,JWT_SECRET);next()}catch{return res.status(401).json({message:'Session expired. Please login again.'})}}
+function adminOnly(req,res,next){if(req.user?.role!=='admin')return res.status(403).json({message:'Admin access required.'});next()}
+function deliveryOnly(req,res,next){if(req.user?.role!=='delivery')return res.status(403).json({message:'Delivery partner access required.'});next()}
+const Counter = mongoose.model('Counter', new mongoose.Schema({key:{type:String,unique:true},seq:{type:Number,default:0}}))
+async function makeAllocationCode(service,plan=''){
+  const prefix=service==='laundry'?'LW':service==='party'?'PW':service==='additional-food'?'AF':'TW'
+  const key=service==='tiffin'?`tiffin-${plan==='premium'?'premium':'standard'}`:service
+  const row=await Counter.findOneAndUpdate({key},{$inc:{seq:1}},{upsert:true,new:true,setDefaultsOnInsert:true})
+  const base=`${prefix} ${String(row.seq).padStart(4,'0')}`
+  return service==='tiffin'&&plan==='premium'?`${base}-P`:base
+}
+const todayName=()=>new Intl.DateTimeFormat('en-US',{weekday:'long',timeZone:'Asia/Kolkata'}).format(new Date())
+const money=n=>Math.round(Number(n)||0)
+async function autoAssignDeliveryIfEligible(booking){
+  if(!booking || booking.paymentStatus!=='paid' || !['monthly-tiffin','laundry','additional-food'].includes(booking.service)) return booking
+  if(booking.deliveryPartnerId) return booking
+  const menu=await Menu.findOne({key:'main'}).lean()
+  if(menu?.deliverySettings?.autoAssignSingle===false) return booking
+  const partners=await DeliveryPartner.find({active:true}).select('partnerId').sort({createdAt:1}).lean()
+  if(partners.length!==1) return booking
+  booking.deliveryPartnerId=partners[0].partnerId
+  booking.deliveryAssignedAt=new Date()
+  booking.deliveryStatus='assigned'
+  return booking
+}
+async function autoAssignSingleUnassigned(){
+  const menu=await Menu.findOne({key:'main'}).lean()
+  if(menu?.deliverySettings?.autoAssignSingle===false) return 0
+  const partners=await DeliveryPartner.find({active:true}).select('partnerId').sort({createdAt:1}).lean()
+  if(partners.length!==1) return 0
+  const result=await Order.updateMany({service:{$in:['monthly-tiffin','laundry','additional-food']},paymentStatus:'paid',deliveryPartnerId:{$in:['',null]},deliveryStatus:{$in:['unassigned','']}},{$set:{deliveryPartnerId:partners[0].partnerId,deliveryAssignedAt:new Date(),deliveryStatus:'assigned'}})
+  return Number(result.modifiedCount||0)
+}
+
+function mailer(){if(!process.env.SMTP_HOST||!process.env.SMTP_USER||!process.env.SMTP_PASS)return null;return nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:String(process.env.SMTP_SECURE||'false')==='true',auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}})}
+
+async function syncRazorpayPayment(booking){
+  if(!booking||booking.paymentStatus==='paid'||!booking.razorpayOrderId||!process.env.RAZORPAY_KEY_ID||!process.env.RAZORPAY_KEY_SECRET)return booking
+  try{
+    const rp=new Razorpay({key_id:process.env.RAZORPAY_KEY_ID,key_secret:process.env.RAZORPAY_KEY_SECRET})
+    const ro=await rp.orders.fetch(booking.razorpayOrderId)
+    let captured=null
+    if(String(ro?.status||'')==='paid'){
+      const payments=await rp.orders.fetchPayments(booking.razorpayOrderId)
+      captured=(payments?.items||[]).find(p=>p.status==='captured'&&Number(p.amount)===money(booking.total)*100)
+    }
+    if(captured){
+      booking.paymentStatus='paid'
+      booking.paymentMethod=String(captured.method||'razorpay')
+      booking.razorpayPaymentId=captured.id
+      booking.paidAt=booking.paidAt||new Date()
+      if(!booking.allocationCode){const code=await makeAllocationCode(booking.service==='monthly-tiffin'?'tiffin':booking.service,booking.plan);booking.orderId=code;booking.allocationCode=code}
+      booking.status='confirmed'
+      booking.serviceStatus='allocated'
+      booking.allocatedAt=booking.allocatedAt||new Date()
+      if(booking.referralOffer&&booking.referralOfferType==='free-press'&&booking.referralOfferStatus!=='claimed'){booking.referralOfferStatus='claimed';booking.referralOfferClaimedAt=new Date();await User.findByIdAndUpdate(booking.userId,{$inc:{pressOfferCredits:1}})}
+      await autoAssignDeliveryIfEligible(booking)
+      await booking.save()
+    }
+  }catch(e){console.warn('[PAYMENT SYNC]',booking.orderId,e.message)}
+  return booking
+}
+async function ensureDefaults(){
+  const m=await Menu.findOne({key:'main'});
+  if(!m){
+    await Menu.create(defaultMenu)
+  }else{
+    let dirty=false
+    if(!Array.isArray(m.monthlyPlans)||!m.monthlyPlans.length){m.monthlyPlans=defaultMenu.monthlyPlans.map(p=>({...p}));dirty=true}
+    else {
+      // Keep administrator-created plans and their prices; only append missing required plans.
+      const existingIds=new Set(m.monthlyPlans.map(x=>String(x?.id||'')))
+      for(const basePlan of defaultMenu.monthlyPlans){if(!existingIds.has(basePlan.id)){m.monthlyPlans.push({...basePlan});dirty=true}}
+    }
+    m.monthlyPlans=m.monthlyPlans.map((p)=>{const weekly=p.weekly&&typeof p.weekly==='object'?p.weekly:cloneWeekly(m.weekly||defaultMenu.weekly); if(p.id==='standard') for(const day of days){if(weekly[day]) delete weekly[day].morning} return {...p,weekly}}); m.markModified('monthlyPlans'); dirty=true
+    if(!m.preBooking || typeof m.preBooking!=='object'){m.preBooking=defaultMenu.preBooking;dirty=true}
+    else {m.preBooking={...defaultMenu.preBooking,...m.preBooking};dirty=true}
+    if(!m.paymentWindow || typeof m.paymentWindow!=='object'){m.paymentWindow=defaultMenu.paymentWindow;dirty=true}else{m.paymentWindow={...defaultMenu.paymentWindow,...m.paymentWindow};dirty=true}
+    if(!m.referral || typeof m.referral!=='object'){m.referral=defaultMenu.referral;dirty=true}else{m.referral={...defaultMenu.referral,...m.referral};dirty=true}
+    if(!m.deliverySettings || typeof m.deliverySettings!=='object'){m.deliverySettings=defaultMenu.deliverySettings;dirty=true}else{m.deliverySettings={...defaultMenu.deliverySettings,...m.deliverySettings};dirty=true}
+    if(!m.serviceAddresses || typeof m.serviceAddresses!=='object'){m.serviceAddresses=defaultMenu.serviceAddresses;dirty=true}else{m.serviceAddresses={...defaultMenu.serviceAddresses,...m.serviceAddresses};dirty=true}
+    if(!Array.isArray(m.rulesBook)||!m.rulesBook.length){m.rulesBook=defaultMenu.rulesBook;dirty=true}
+    if(Array.isArray(m.party?.packages)){m.party.packages=m.party.packages.filter(x=>x?.id==='standard'||x?.id==='premium'); if(!m.party.packages.length)m.party.packages=defaultMenu.party.packages; dirty=true}
+    if(!Number.isFinite(Number(m.monthlyPrice)) || Number(m.monthlyPrice)<=0){m.monthlyPrice=defaultMenu.monthlyPrice;dirty=true}
+    if(!Array.isArray(m.daily) || m.daily.length){m.daily=[];dirty=true}
+    if(!m.weekly || typeof m.weekly!=='object'){m.weekly=defaultMenu.weekly;dirty=true}else{
+      const weekly={...defaultMenu.weekly,...m.weekly}
+      for(const day of days){
+        weekly[day]={...defaultMenu.weekly[day],...(m.weekly[day]||{})}
+        for(const meal of ['morning','lunch','dinner']) weekly[day][meal]={...defaultMenu.weekly[day][meal],...(m.weekly[day]?.[meal]||{})}
+      }
+      m.weekly=weekly;dirty=true
+    }
+    const existingParty=(m.party&&typeof m.party==='object')?m.party:{}
+    const party={...defaultMenu.party,...existingParty}
+    party.pricePerPlate=Number.isFinite(Number(existingParty.pricePerPlate))?Number(existingParty.pricePerPlate):defaultMenu.party.pricePerPlate
+    party.minGuests=Math.max(1,Number(existingParty.minGuests)||defaultMenu.party.minGuests)
+    party.packages=Array.isArray(existingParty.packages)&&existingParty.packages.length?existingParty.packages:defaultMenu.party.packages
+    const partyById=new Map((Array.isArray(existingParty.packages)?existingParty.packages:[]).filter(x=>x?.id==='standard'||x?.id==='premium').map(x=>[x.id,x]));
+    party.packages=['standard','premium'].map(id=>{
+      const base=partyById.get(id)||defaultMenu.party.packages.find(x=>x.id===id);
+      const pm=base.menu&&typeof base.menu==='object'?JSON.parse(JSON.stringify(base.menu)):{starters:JSON.parse(JSON.stringify(defaultMenu.party.starters)),mainCourse:JSON.parse(JSON.stringify(defaultMenu.party.mainCourse)),breadsRice:JSON.parse(JSON.stringify(defaultMenu.party.breadsRice)),desserts:JSON.parse(JSON.stringify(defaultMenu.party.desserts)),drinks:JSON.parse(JSON.stringify(defaultMenu.party.drinks))};
+      pm.starters=(pm.starters||[]).filter(x=>String(x.id||'')!=='starter-samosa' && !/samosa/i.test(String(x.name||'')));
+      if(!(pm.breadsRice||[]).some(x=>/biryani/i.test(String(x.name||'')))) pm.breadsRice=[...(pm.breadsRice||[]),{id:'rice-biryani',name:'Veg Biryani',pricePerPlate:45}];
+      return {...base,menu:pm}
+    });
+    for(const key of ['starters','mainCourse','breadsRice','desserts','drinks']){
+      party[key]=Array.isArray(existingParty[key])?existingParty[key]:defaultMenu.party[key]
+      if(!party[key].length) party[key]=defaultMenu.party[key]
+    }
+    m.party=party
+    m.markModified('party')
+    dirty=true
+    if(dirty)await m.save()
+  }
+  if(!await Laundry.exists({key:'main'}))await Laundry.create({key:'main',items:defaultLaundry})
+  let admin=await User.findOne({email:ADMIN_EMAIL});const hash=await bcrypt.hash(ADMIN_PASSWORD,10);if(!admin)await User.create({name:'Tiffin Wallah Admin',email:ADMIN_EMAIL,passwordHash:hash,role:'admin'});else if(admin.role!=='admin'){admin.role='admin';await admin.save()}
+  let existingDelivery=await DeliveryPartner.findOne({partnerId:DELIVERY_PARTNER_ID});
+  const bootstrapReady=Boolean((await Menu.findOne({key:'main'}).lean())?.deliverySettings?.bootstrapInitialized);
+  if(!existingDelivery && !bootstrapReady){
+    existingDelivery=await DeliveryPartner.create({partnerId:DELIVERY_PARTNER_ID,name:'Primary Delivery Partner',passwordHash:await bcrypt.hash(DELIVERY_PARTNER_PASSWORD,10),createdBy:'env',active:true})
+    const bootMenu=await Menu.findOne({key:'main'});if(bootMenu){bootMenu.deliverySettings={...(bootMenu.deliverySettings||{}),bootstrapInitialized:true};bootMenu.markModified('deliverySettings');await bootMenu.save()}
+  }else if(existingDelivery?.createdBy==='env'){
+    const matches=await bcrypt.compare(DELIVERY_PARTNER_PASSWORD,existingDelivery.passwordHash);
+    if(!matches) existingDelivery.passwordHash=await bcrypt.hash(DELIVERY_PARTNER_PASSWORD,10);
+    existingDelivery.active=true;
+    if(!existingDelivery.name) existingDelivery.name='Primary Delivery Partner';
+    await existingDelivery.save();
+  }
+}
+
+app.get('/api/health',(_,res)=>res.json({ok:true,service:'Tiffin Wallah API',database:mongoose.connection.readyState===1?'mongodb':'offline',environment:process.env.NODE_ENV||'development'}))
+app.get('/api/menu',async(_,res)=>{const m=await Menu.findOne({key:'main'}).lean();if(!m)return res.status(503).json({message:'Tiffin menu is not initialized.'});const today=todayName();res.json({...m,premiumMorningEnabled:m.premiumMorningEnabled!==false,additionalFoods:Array.isArray(m.additionalFoods)?m.additionalFoods:defaultMenu.additionalFoods,today,todayMeals:m.weekly?.[today]||{}})})
+app.get('/api/laundry',async(_,res)=>{const x=await Laundry.findOne({key:'main'}).lean();if(!x)return res.status(503).json({message:'Laundry pricing is not initialized.'});res.json(x.items||[])})
+
+app.post('/api/auth/register',authRateLimit,async(req,res,next)=>{try{const {name,email,password,phone}=req.body||{};if(!name||!email||!password)return res.status(400).json({message:'Name, email and password are required.'});if(String(password).length<6)return res.status(400).json({message:'Password must be at least 6 characters.'});const normalized=String(email).trim().toLowerCase();if(await User.exists({email:normalized}))return res.status(409).json({message:'An account with this email already exists.'});const u=await User.create({name:String(name).trim(),email:normalized,phone:phone||'',passwordHash:await bcrypt.hash(password,10),role:'customer'});res.status(201).json({token:tokenFor(u),user:safeUser(u),needsAddress:true})}catch(e){next(e)}})
+app.post('/api/auth/login',authRateLimit,async(req,res,next)=>{try{
+  const login=String(req.body?.email||req.body?.partnerId||'').trim(); const password=String(req.body?.password||'')
+  const partner=await DeliveryPartner.findOne({partnerId:login.toUpperCase(),active:true})
+  if(partner && await bcrypt.compare(password,partner.passwordHash)){
+    const deliveryUser={_id:partner._id,name:partner.name,email:`${partner.partnerId}@delivery.tiffinwallah`,role:'delivery',phone:partner.phone||'',address:'',city:'',pincode:'',addresses:[],pressOfferCredits:0,createdAt:partner.createdAt}
+    return res.json({token:jwt.sign({id:String(partner._id),email:deliveryUser.email,role:'delivery',name:partner.name,partnerId:partner.partnerId},JWT_SECRET,{expiresIn:'7d'}),user:{...deliveryUser,id:String(partner._id),partnerId:partner.partnerId},needsAddress:false})
+  }
+  const u=await User.findOne({email:login.toLowerCase()});if(!u||!(await bcrypt.compare(password,u.passwordHash)))return res.status(401).json({message:'Invalid email/password or delivery partner ID.'});res.json({token:tokenFor(u),user:safeUser(u),needsAddress:!u.address})
+}catch(e){next(e)}})
+app.get('/api/auth/me',auth,async(req,res,next)=>{try{const u=await User.findById(req.user.id);if(!u)return res.status(404).json({message:'User not found.'});res.json({user:safeUser(u),needsAddress:!u.address})}catch(e){next(e)}})
+app.get('/api/auth/addresses',auth,async(req,res,next)=>{try{const u=await User.findById(req.user.id);if(!u)return res.status(404).json({message:'User not found.'});res.json((u.addresses||[]).map(a=>({id:String(a._id),label:a.label,address:a.address,city:a.city,pincode:a.pincode,phone:a.phone||'',isDefault:!!a.isDefault})));}catch(e){next(e)}})
+app.post('/api/auth/addresses',auth,async(req,res,next)=>{try{const u=await User.findById(req.user.id);if(!u)return res.status(404).json({message:'User not found.'});const {label='Home',address,city,pincode,phone=''}=req.body||{};if(!address||!city||!pincode)return res.status(400).json({message:'Address, city and pincode are required.'});const makeDefault=!u.addresses?.length;u.addresses.push({label:String(label).trim()||'Home',address:String(address).trim(),city:String(city).trim(),pincode:String(pincode).trim(),phone:String(phone||u.phone).trim(),isDefault:makeDefault});if(makeDefault){u.address=String(address).trim();u.city=String(city).trim();u.pincode=String(pincode).trim()}await u.save();res.status(201).json({user:safeUser(u)});}catch(e){next(e)}})
+app.put('/api/auth/addresses/:id/default',auth,async(req,res,next)=>{try{const u=await User.findById(req.user.id);if(!u)return res.status(404).json({message:'User not found.'});const target=u.addresses.id(req.params.id);if(!target)return res.status(404).json({message:'Address not found.'});u.addresses.forEach(a=>a.isDefault=false);target.isDefault=true;u.address=target.address;u.city=target.city;u.pincode=target.pincode;if(target.phone)u.phone=target.phone;await u.save();res.json({user:safeUser(u)});}catch(e){next(e)}})
+app.delete('/api/auth/addresses/:id',auth,async(req,res,next)=>{try{const u=await User.findById(req.user.id);if(!u)return res.status(404).json({message:'User not found.'});const target=u.addresses.id(req.params.id);if(!target)return res.status(404).json({message:'Address not found.'});const wasDefault=target.isDefault;target.deleteOne();if(wasDefault&&u.addresses.length){u.addresses[0].isDefault=true;u.address=u.addresses[0].address;u.city=u.addresses[0].city;u.pincode=u.addresses[0].pincode}if(!u.addresses.length){u.address='';u.city='';u.pincode=''}await u.save();res.json({user:safeUser(u)});}catch(e){next(e)}})
+app.put('/api/auth/change-password',auth,async(req,res,next)=>{try{const u=await User.findById(req.user.id);if(!u)return res.status(404).json({message:'User not found.'});const current=String(req.body?.currentPassword||''),nextPassword=String(req.body?.newPassword||'');if(nextPassword.length<6)return res.status(400).json({message:'New password must be at least 6 characters.'});if(!await bcrypt.compare(current,u.passwordHash))return res.status(400).json({message:'Current password is incorrect.'});u.passwordHash=await bcrypt.hash(nextPassword,10);await u.save();res.json({message:'Password changed successfully.'});}catch(e){next(e)}})
+app.put('/api/auth/profile',auth,async(req,res,next)=>{try{const u=await User.findById(req.user.id);if(!u)return res.status(404).json({message:'User not found.'});for(const k of ['name','phone','address','city','pincode'])if(req.body?.[k]!==undefined)u[k]=String(req.body[k]).trim();if(req.body?.address&&req.body?.city&&req.body?.pincode){let d=(u.addresses||[]).find(a=>a.isDefault);if(!d){u.addresses.push({label:'Home',address:u.address,city:u.city,pincode:u.pincode,phone:u.phone,isDefault:true})}else{d.address=u.address;d.city=u.city;d.pincode=u.pincode;d.phone=u.phone}}await u.save();res.json({user:safeUser(u)})}catch(e){next(e)}})
+app.post('/api/auth/forgot-password',passwordRateLimit,async(req,res,next)=>{try{const email=String(req.body?.email||'').trim().toLowerCase();const generic={message:'If an account exists for this email, a password reset link has been sent.'};const u=await User.findOne({email});if(!u)return res.json(generic);const raw=crypto.randomBytes(32).toString('hex');u.resetPasswordToken=crypto.createHash('sha256').update(raw).digest('hex');u.resetPasswordExpires=new Date(Date.now()+30*60*1000);await u.save();const resetUrl=`${CLIENT_URL}/reset-password?token=${raw}`;const transport=mailer();if(transport)await transport.sendMail({from:process.env.SMTP_FROM||process.env.SMTP_USER,to:u.email,subject:'Tiffin Wallah password reset',text:`Reset your password: ${resetUrl}\nThis link expires in 30 minutes.`});else if(process.env.NODE_ENV!=='production')return res.json({...generic,developmentResetUrl:resetUrl});res.json(generic)}catch(e){next(e)}})
+app.post('/api/auth/reset-password',passwordRateLimit,async(req,res,next)=>{try{const {token,password}=req.body||{};if(!token||String(password||'').length<6)return res.status(400).json({message:'A valid token and password of at least 6 characters are required.'});const hashed=crypto.createHash('sha256').update(token).digest('hex');const u=await User.findOne({resetPasswordToken:hashed,resetPasswordExpires:{$gt:new Date()}});if(!u)return res.status(400).json({message:'Reset link is invalid or expired.'});u.passwordHash=await bcrypt.hash(password,10);u.resetPasswordToken=null;u.resetPasswordExpires=null;await u.save();res.json({message:'Password changed successfully. You can login now.'})}catch(e){next(e)}})
+
+async function buildOrder(req){
+  const u=await User.findById(req.user.id);if(!u)return {error:[404,'Customer account not found.']}
+  const body=req.body||{};const chosen=body.addressId?u.addresses?.id(body.addressId):null;const address=chosen||((u.address&&u.city&&u.pincode)?{address:u.address,city:u.city,pincode:u.pincode,phone:u.phone}:null);if(!address?.address||!address?.city||!address?.pincode)return {error:[400,'Please choose or complete a saved address before ordering.']}
+  const menu=await Menu.findOne({key:'main'}).lean();const laundry=await Laundry.findOne({key:'main'}).lean();let total=0,normalized={service:body.service,plan:body.plan,meal:body.meal,mealName:body.mealName,day:body.day,quantity:money(body.quantity)||1,date:body.date,pickupDate:body.pickupDate,guests:money(body.guests),time:body.time,eventType:body.eventType,packageId:body.packageId,packageName:body.packageName,notes:String(body.notes||'').slice(0,1000),addressId:body.addressId||'',selectedMenu:Array.isArray(body.selectedMenu)?body.selectedMenu:[],addOns:Array.isArray(body.addOns)?body.addOns:[],items:body.items||[],referralCode:'',referralOffer:false,referralOfferStatus:'none',referralOfferTitle:'',referralOfferDescription:'',paymentDueStartDay:1,paymentDueEndDay:5,usePressOffer:Boolean(body.usePressOffer)};
+  if(body.service==='daily-tiffin')return {error:[400,'Daily tiffin service has been replaced by monthly Standard and Premium plans.']};
+  else if(body.service==='monthly-tiffin'){const plan=body.plan==='premium'?'premium':'standard';const cfg=(menu.monthlyPlans||[]).find(x=>x.id===plan)||defaultMenu.monthlyPlans.find(x=>x.id===plan);total=money(cfg.price);normalized.quantity=1;normalized.plan=plan;normalized.mealName=cfg.name;normalized.selectedMenu=[];
+    const now=new Date(); const day=Number(new Intl.DateTimeFormat('en-US',{day:'numeric',timeZone:'Asia/Kolkata'}).format(now)); const payStart=Number(menu.paymentWindow?.startDay||1), payEnd=Number(menu.paymentWindow?.endDay||5); normalized.paymentDueStartDay=payStart; normalized.paymentDueEndDay=payEnd;
+    const referralCode=String(body.referralCode||'').trim().toUpperCase();
+    if(referralCode){
+      const ref=menu.referral||{};
+      const configured=String(ref.code||'').trim().toUpperCase();
+      if(!ref.enabled || !configured || referralCode!==configured)return {error:[400,'This referral/coupon code is invalid or inactive.']};
+      if(ref.expiresAt && new Date(ref.expiresAt).getTime()<=Date.now())return {error:[400,'This referral/coupon code has expired.']};
+      if(ref.oneUsePerCustomer && await Order.exists({userId:u._id,referralCode,paymentStatus:'paid'}))return {error:[400,'This referral/coupon has already been used on your account.']};
+      const offerType=['free-press','percentage','fixed'].includes(String(ref.offerType||''))?String(ref.offerType):'free-press';
+      const offerValue=Math.max(0,money(ref.value));
+      normalized.referralCode=referralCode;
+      normalized.referralOffer=true;
+      normalized.referralOfferStatus='applied';
+      normalized.referralOfferType=offerType;
+      normalized.referralOfferValue=offerValue;
+      normalized.referralOfferTitle=String(ref.title||'Referral offer');
+      normalized.referralOfferDescription=String(ref.description||'');
+      if(offerType==='percentage')normalized.referralDiscount=Math.min(total,Math.round(total*Math.min(100,offerValue)/100));
+      if(offerType==='fixed')normalized.referralDiscount=Math.min(total,offerValue);
+      total=Math.max(0,total-Number(normalized.referralDiscount||0));
+    }
+    const preBooking=Boolean(body.preBooking);
+    if(preBooking){if(!menu.preBooking?.enabled)return {error:[400,'Pre-booking is currently disabled by the administrator.']};normalized.preBooking=true;normalized.offerTitle=String(menu.preBooking.offerTitle||'Pre-booking offer');normalized.offerDescription=String(menu.preBooking.offerDescription||'');normalized.offerStatus='locked';const now=new Date();normalized.offerAvailableAt=new Date(now.getTime()+Number(menu.preBooking.claimAfterDays||15)*86400000);const expiry=new Date(now);expiry.setMonth(expiry.getMonth()+Number(menu.preBooking.expiresAfterMonths||2));normalized.offerExpiresAt=expiry}
+  }
+  else if(body.service==='additional-food'){const requested=Array.isArray(body.items)?body.items:[];if(!requested.length)return {error:[400,'Choose at least one additional food item.']};if(!body.date)return {error:[400,'Delivery date is required.']};const available=Array.isArray(menu.additionalFoods)?menu.additionalFoods:defaultMenu.additionalFoods;const extras=[];for(const row of requested){const item=available.find(x=>x.id===String(row.id||'')&&x.enabled!==false);const qty=Math.max(0,Math.min(20,money(row.quantity)));if(!item||qty<1)return {error:[400,'One of the selected extra food items is unavailable or has an invalid quantity.']};extras.push({id:item.id,name:item.name,quantity:qty,price:money(item.price)});total+=money(item.price)*qty;}normalized.mealName='Additional Food';normalized.date=String(body.date);normalized.time=String(body.time||'');normalized.quantity=extras.reduce((sum,x)=>sum+x.quantity,0);normalized.addOns=extras;normalized.items=extras;normalized.plan='one-time';normalized.notes=String(body.notes||'').slice(0,1000)}
+  else if(body.service==='party'){const pkg=menu.party?.packages?.find(x=>(x.id==='standard'||x.id==='premium')&&x.id===body.packageId);const guests=money(body.guests);if(!pkg)return {error:[400,'Choose a valid party package.']};if(guests<Number(menu.party?.minGuests||1))return {error:[400,`Minimum ${menu.party.minGuests||1} guests required.`]};if(!body.date||!body.time)return {error:[400,'Event date and time are required.']};const packageMenu=pkg.menu&&typeof pkg.menu==='object'?pkg.menu:menu.party;const allItems=[...(packageMenu.starters||[]),...(packageMenu.mainCourse||[]),...(packageMenu.breadsRice||[]),...(packageMenu.desserts||[]),...(packageMenu.drinks||[])];const chosenIds=new Set([...(body.selectedMenu||[]),...(body.addOns||[])]);const invalid=[...chosenIds].filter(id=>!allItems.some(x=>x.id===id));if(invalid.length)return {error:[400,'One of the selected party menu items is unavailable for this package.']};const extras=allItems.filter(x=>chosenIds.has(x.id)).reduce((sum,x)=>sum+money(x.pricePerPlate),0);total=(money(pkg.price)+extras)*guests;normalized.packageName=pkg.name;normalized.guests=guests;normalized.selectedMenu=[...(body.selectedMenu||[])];normalized.addOns=[...(body.addOns||[])]}
+  else if(body.service==='laundry'){const mode=['wash','press','wash-press'].includes(body.serviceType)?body.serviceType:body.service;const selected=Array.isArray(body.items)?body.items:[];if(!selected.length)return {error:[400,'Select at least one cloth type.']};if(!body.pickupDate||!body.time)return {error:[400,'Pickup date and time are required.']};for(const item of selected){const id=typeof item==='string'?item:item.id;const qty=Math.max(1,money(typeof item==='object'?item.quantity:1));const row=laundry?.items?.find(x=>x.id===id);if(!row)return {error:[400,'One of the selected laundry items is unavailable.']};total+=money(row.prices?.[mode])*qty}if(normalized.usePressOffer){if(Number(u.pressOfferCredits||0)<1)return {error:[400,'No free Press Wallah offer is available on this account.']};normalized.pressOfferUsed=true;total=0}normalized.serviceType=mode;normalized.items=selected}
+  else return {error:[400,'Unsupported service.']}
+  normalized.address=address.address;normalized.city=address.city;normalized.pincode=address.pincode;return {user:u,normalized,total}
+}
+
+app.post('/api/bookings',auth,async(req,res,next)=>{try{if(String(req.body?.service||'')==='laundry'){const serviceSettings=await Menu.findOne({key:'main'}).select('laundryEnabled').lean();if(serviceSettings?.laundryEnabled===false)return res.status(503).json({message:'Laundry / Press Wallah service is temporarily unavailable. We’re sorry for the inconvenience.'})}const result=await buildOrder(req);if(result.error)return res.status(result.error[0]).json({message:result.error[1]});const {user,normalized,total}=result;const tempOrderId=`PENDING-${crypto.randomBytes(5).toString('hex').toUpperCase()}`;if(total===0&&normalized.pressOfferUsed){const fresh=await User.findOneAndUpdate({_id:user._id,pressOfferCredits:{$gt:0}},{$inc:{pressOfferCredits:-1}},{new:true});if(!fresh)return res.status(400).json({message:'Your free Press Wallah offer is no longer available.'});const code=await makeAllocationCode('laundry');const b=await Order.create({...normalized,total:0,orderId:code,allocationCode:code,userId:user._id,status:'confirmed',paymentStatus:'paid',paymentMethod:'offer',paidAt:new Date(),serviceStatus:'allocated',allocatedAt:new Date()});await autoAssignDeliveryIfEligible(b);await b.save();return res.status(201).json({orderId:b.orderId,booking:b})}const b=await Order.create({...normalized,total,orderId:tempOrderId,userId:user._id,status:'awaiting-payment',paymentStatus:'pending'});res.status(201).json({orderId:b.orderId,booking:b})}catch(e){next(e)}})
+app.post('/api/bookings/:orderId/pay',auth,async(req,res,next)=>{try{const b=await Order.findOne({orderId:req.params.orderId});if(!b)return res.status(404).json({message:'Booking not found.'});if(String(b.userId)!==req.user.id&&req.user.role!=='admin')return res.status(403).json({message:'You cannot pay for this booking.'});if(b.paymentStatus==='paid')return res.json({keyId:process.env.RAZORPAY_KEY_ID||'',razorpayOrderId:b.razorpayOrderId||'',amount:money(b.total)*100,currency:'INR',booking:b,alreadyPaid:true});if(!process.env.RAZORPAY_KEY_ID||!process.env.RAZORPAY_KEY_SECRET)return res.status(503).json({message:'Razorpay is not configured on the server. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to server/.env and restart the API.'});if(b.razorpayOrderId){return res.json({keyId:process.env.RAZORPAY_KEY_ID,razorpayOrderId:b.razorpayOrderId,amount:money(b.total)*100,currency:'INR',booking:b,reused:true})}const rp=new Razorpay({key_id:process.env.RAZORPAY_KEY_ID,key_secret:process.env.RAZORPAY_KEY_SECRET});const ro=await rp.orders.create({amount:money(b.total)*100,currency:'INR',receipt:b.orderId,notes:{service:b.service,userId:String(b.userId)}});if(!ro?.id)return res.status(502).json({message:'Razorpay did not return a payment order. Please try again.'});b.razorpayOrderId=ro.id;await b.save();res.json({keyId:process.env.RAZORPAY_KEY_ID,razorpayOrderId:ro.id,amount:ro.amount,currency:ro.currency,booking:b})}catch(e){next(e)}})
+app.get('/api/bookings/:orderId/payment-status',auth,async(req,res,next)=>{try{const b=await Order.findOne({orderId:req.params.orderId});if(!b)return res.status(404).json({message:'Booking not found.'});if(String(b.userId)!==req.user.id&&req.user.role!=='admin')return res.status(403).json({message:'Not authorized.'});const updated=await syncRazorpayPayment(b);res.json({booking:updated})}catch(e){next(e)}})
+app.post('/api/bookings/:orderId/verify-payment',auth,async(req,res,next)=>{try{const {razorpay_order_id,razorpay_payment_id,razorpay_signature}=req.body||{};const b=await Order.findOne({orderId:req.params.orderId});if(!b)return res.status(404).json({message:'Booking not found.'});if(String(b.userId)!==req.user.id&&req.user.role!=='admin')return res.status(403).json({message:'Not authorized.'});if(!process.env.RAZORPAY_KEY_SECRET||!razorpay_order_id||!razorpay_payment_id||!razorpay_signature)return res.status(400).json({message:'Incomplete payment verification data.'});const expected=crypto.createHmac('sha256',process.env.RAZORPAY_KEY_SECRET).update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');if(!/^[a-f0-9]{64}$/i.test(String(razorpay_signature))||!crypto.timingSafeEqual(Buffer.from(expected,'hex'),Buffer.from(String(razorpay_signature),'hex'))||b.razorpayOrderId!==razorpay_order_id)return res.status(400).json({message:'Payment verification failed. Booking was not confirmed.'});if(b.paymentStatus==='paid'&&b.razorpayPaymentId===razorpay_payment_id)return res.json({orderId:b.orderId,booking:b,alreadyPaid:true});if(b.paymentStatus==='paid')return res.status(409).json({message:'This booking is already marked as paid.'});if(!process.env.RAZORPAY_KEY_ID)return res.status(503).json({message:'Razorpay is not configured.'});const rp=new Razorpay({key_id:process.env.RAZORPAY_KEY_ID,key_secret:process.env.RAZORPAY_KEY_SECRET});const payment=await rp.payments.fetch(razorpay_payment_id);if(!payment||payment.order_id!==razorpay_order_id||payment.status!=='captured'||Number(payment.amount)!==money(b.total)*100||String(payment.currency||'INR')!=='INR')return res.status(409).json({message:'Payment is not captured or its amount does not match this booking. The booking has not been confirmed.'});const actualMethod=String(payment.method||req.body?.payment_preference||'razorpay');b.paymentStatus='paid';b.paymentMethod=actualMethod;b.razorpayPaymentId=razorpay_payment_id;b.paidAt=new Date();if(!b.allocationCode){const code=await makeAllocationCode(b.service==='monthly-tiffin'?'tiffin':b.service,b.plan);b.orderId=code;b.allocationCode=code}b.status='confirmed';b.serviceStatus='allocated';b.allocatedAt=new Date();if(b.referralOffer&&b.referralOfferType==='free-press'&&b.referralOfferStatus!=='claimed'){b.referralOfferStatus='claimed';b.referralOfferClaimedAt=new Date();await User.findByIdAndUpdate(b.userId,{$inc:{pressOfferCredits:1}})}await autoAssignDeliveryIfEligible(b);await b.save();res.json({orderId:b.orderId,booking:b})}catch(e){next(e)}})
+app.post('/api/bookings/:orderId/claim-offer',auth,async(req,res,next)=>{try{const b=await Order.findOne({orderId:req.params.orderId});if(!b)return res.status(404).json({message:'Booking not found.'});if(String(b.userId)!==req.user.id)return res.status(403).json({message:'Not authorized.'});if(!b.preBooking||!b.offerTitle)return res.status(400).json({message:'This booking has no pre-booking offer.'});const now=new Date();if(b.offerStatus==='claimed')return res.status(400).json({message:'This offer has already been claimed.'});if(now<b.offerAvailableAt)return res.status(400).json({message:`Your offer becomes available on ${new Date(b.offerAvailableAt).toLocaleDateString('en-IN')}.`});if(now>b.offerExpiresAt){b.offerStatus='expired';await b.save();return res.status(400).json({message:'This offer has expired.'});}b.offerStatus='claimed';b.offerClaimedAt=now;await b.save();await User.findByIdAndUpdate(req.user.id,{$inc:{pressOfferCredits:1}});res.json({message:'Pre-booking Press Wallah offer claimed successfully. You now have 1 free Press Wallah service.',booking:b})}catch(e){next(e)}})
+app.get('/api/service-addresses',async(_,res,next)=>{try{const m=await Menu.findOne({key:'main'}).lean();res.json(m?.serviceAddresses||defaultMenu.serviceAddresses)}catch(e){next(e)}})
+app.get('/api/payment-window',async(_,res,next)=>{try{const m=await Menu.findOne({key:'main'}).lean();res.json(m?.paymentWindow||defaultMenu.paymentWindow)}catch(e){next(e)}})
+app.post('/api/bookings/:orderId/pause',auth,async(req,res,next)=>{try{const b=await Order.findOne({orderId:req.params.orderId,userId:req.user.id});if(!b)return res.status(404).json({message:'Booking not found.'});if(b.paymentStatus!=='paid')return res.status(400).json({message:'Only paid services can be paused.'});if(!['monthly-tiffin','laundry'].includes(b.service))return res.status(400).json({message:'Pause is available for monthly tiffin and Press Wallah services.'});const start=String(req.body?.startDate||''),end=String(req.body?.endDate||'');if(!start||!end)return res.status(400).json({message:'Pause start and end dates are required.'});const a=new Date(start+'T00:00:00+05:30'),z=new Date(end+'T23:59:59+05:30');if(Number.isNaN(a.getTime())||Number.isNaN(z.getTime())||z<a)return res.status(400).json({message:'Choose a valid pause date range.'});const days=Math.floor((z-a)/86400000)+1;if(days<3)return res.status(400).json({message:'A service pause must be 3 days or more.'});if(days>31)return res.status(400).json({message:'A single pause cannot exceed 31 days.'});const overlap=(b.pauseRequests||[]).some(r=>r.status!=='rejected'&&start<=String(r.endDate||'')&&end>=String(r.startDate||''));if(overlap)return res.status(400).json({message:'This pause overlaps an existing pause request.'});b.pauseRequests=[...(b.pauseRequests||[]),{startDate:start,endDate:end,days,status:'pending',requestedAt:new Date()}];b.servicePaused=true;b.servicePauseStart=start;b.servicePauseEnd=end;await b.save();res.json({message:'Service paused for the requested dates. The pause request is visible in the admin portal.',booking:b})}catch(e){next(e)}})
+app.get('/api/bookings/:orderId/pause',auth,async(req,res,next)=>{try{const b=await Order.findOne({orderId:req.params.orderId,userId:req.user.id}).lean();if(!b)return res.status(404).json({message:'Booking not found.'});res.json({pauseRequests:b.pauseRequests||[],servicePaused:!!b.servicePaused})}catch(e){next(e)}})
+app.post('/api/bookings/:orderId/referral-offer/claim',auth,async(req,res,next)=>{try{const b=await Order.findOne({orderId:req.params.orderId,userId:req.user.id});if(!b)return res.status(404).json({message:'Booking not found.'});if(!b.referralOffer)return res.status(400).json({message:'This booking has no referral offer.'});if(b.paymentStatus!=='paid')return res.status(400).json({message:'Complete the Tiffin payment before claiming the referral offer.'});if(b.referralOfferStatus==='claimed')return res.status(400).json({message:'Referral offer already claimed.'});if(b.referralOfferStatus==='expired')return res.status(400).json({message:'Referral offer has expired.'});b.referralOfferStatus='claimed';b.referralOfferClaimedAt=new Date();await b.save();if(b.referralOfferType==='free-press')await User.findByIdAndUpdate(req.user.id,{$inc:{pressOfferCredits:1}});res.json({message:b.referralOfferType==='free-press'?'Referral Press Wallah offer claimed. You now have 1 free Press Wallah service.':'Referral offer claimed successfully.',booking:b})}catch(e){next(e)}})
+app.get('/api/rules',async(_,res,next)=>{try{const m=await Menu.findOne({key:'main'}).lean();res.json({rulesBook:m?.rulesBook||[]})}catch(e){next(e)}})
+app.get('/api/admin/rules',auth,adminOnly,async(_,res,next)=>{try{let m=await Menu.findOne({key:'main'});if(!m)m=await Menu.create({...JSON.parse(JSON.stringify(defaultMenu)),key:'main'});if(!Array.isArray(m.rulesBook)||!m.rulesBook.length){m.rulesBook=[...defaultMenu.rulesBook];await m.save()}res.json({rulesBook:m.rulesBook})}catch(e){next(e)}})
+app.put('/api/admin/rules',auth,adminOnly,async(req,res,next)=>{try{let m=await Menu.findOne({key:'main'});if(!m)m=await Menu.create({...JSON.parse(JSON.stringify(defaultMenu)),key:'main'});if(!Array.isArray(req.body?.rulesBook))return res.status(400).json({message:'rulesBook must be an array.'});const rules=req.body.rulesBook.map(x=>String(x||'').trim()).filter(Boolean).slice(0,50);m.rulesBook=rules.length?rules:[...defaultMenu.rulesBook];await m.save();res.json({rulesBook:m.rulesBook,message:'Rules Book saved successfully.'})}catch(e){next(e)}})
+app.post('/api/coupons/validate',auth,async(req,res,next)=>{try{const code=String(req.body?.code||'').trim().toUpperCase();if(!code)return res.status(400).json({message:'Enter a referral/coupon code.'});const m=await Menu.findOne({key:'main'}).lean();const ref=m?.referral||{};if(!ref.enabled||code!==String(ref.code||'').trim().toUpperCase())return res.status(400).json({message:'Referral/coupon code is invalid or inactive.'});if(ref.expiresAt&&new Date(ref.expiresAt).getTime()<=Date.now())return res.status(400).json({message:'Referral/coupon code has expired.'});if(ref.oneUsePerCustomer&&await Order.exists({userId:req.user.id,referralCode:code,paymentStatus:'paid'}))return res.status(400).json({message:'This referral/coupon has already been used on your account.'});res.json({valid:true,code,title:String(ref.title||'Referral offer'),description:String(ref.description||''),offerType:String(ref.offerType||'free-press'),value:Number(ref.value||0),service:String(ref.service||'laundry-free'),expiresAt:ref.expiresAt||''})}catch(e){next(e)}})
+
+app.get('/api/bookings/my',auth,async(req,res,next)=>{try{const rows=await Order.find({userId:req.user.id}).sort({createdAt:-1});await Promise.all(rows.filter(x=>x.paymentStatus!=='paid'&&x.razorpayOrderId).map(syncRazorpayPayment));res.json(rows.map(x=>x.toObject()))}catch(e){next(e)}})
+app.get('/api/bookings',auth,adminOnly,async(_,res,next)=>{try{const rows=await Order.find().sort({createdAt:-1});await Promise.all(rows.filter(x=>x.paymentStatus!=='paid'&&x.razorpayOrderId).map(syncRazorpayPayment));res.json(await Order.find().populate('userId','name email phone address city pincode').sort({createdAt:-1}).lean())}catch(e){next(e)}})
+app.put('/api/admin/bookings/:orderId/status',auth,adminOnly,async(req,res,next)=>{try{const allowed=['awaiting-payment','confirmed','preparing','packed','out-for-delivery','delivered','cancelled'];const nextStatus=String(req.body?.status||'');if(!allowed.includes(nextStatus))return res.status(400).json({message:'Invalid status.'});const b=await Order.findOne({orderId:req.params.orderId});if(!b)return res.status(404).json({message:'Order not found.'});b.status=nextStatus;if(['monthly-tiffin','laundry','additional-food'].includes(b.service)){if(nextStatus==='out-for-delivery')b.deliveryStatus='out-for-delivery';if(nextStatus==='delivered')b.deliveryStatus='delivered';if(nextStatus==='cancelled'&&b.deliveryStatus!=='delivered'){b.deliveryPartnerId='';b.deliveryAssignedAt=null;b.deliveryStatus='unassigned';}}await b.save();res.json(b)}catch(e){next(e)}})
+
+app.put('/api/admin/menu',auth,adminOnly,async(req,res,next)=>{try{const m=await Menu.findOne({key:'main'});if(!m)return res.status(503).json({message:'Menu not initialized.'});
+  if(req.body.monthlyPrice!==undefined)m.monthlyPrice=Math.max(0,money(req.body.monthlyPrice));
+  if(req.body.laundryEnabled!==undefined)m.laundryEnabled=Boolean(req.body.laundryEnabled);
+  if(req.body.premiumMorningEnabled!==undefined)m.premiumMorningEnabled=Boolean(req.body.premiumMorningEnabled);
+  if(Array.isArray(req.body.additionalFoods))m.additionalFoods=req.body.additionalFoods.slice(0,100).map((x,i)=>({id:String(x.id||`extra-${i+1}`).trim().slice(0,80),name:String(x.name||'Food item').trim().slice(0,100),price:Math.max(0,money(x.price)),description:String(x.description||'').slice(0,300),enabled:x.enabled!==false}));
+  if(Array.isArray(req.body.monthlyPlans))m.monthlyPlans=req.body.monthlyPlans.filter(x=>x?.id==='standard'||x?.id==='premium').map(x=>{const weekly=x.weekly&&typeof x.weekly==='object'?JSON.parse(JSON.stringify(x.weekly)):cloneWeekly(m.weekly||defaultMenu.weekly); if(x.id==='standard') for(const day of days){if(weekly[day]) delete weekly[day].morning} return {id:x.id,name:String(x.name||x.id),price:Math.max(0,money(x.price)),description:String(x.description||''),weekly};});
+  if(req.body.preBooking&&typeof req.body.preBooking==='object')m.preBooking={...defaultMenu.preBooking,...req.body.preBooking,enabled:Boolean(req.body.preBooking.enabled),claimAfterDays:Math.max(1,money(req.body.preBooking.claimAfterDays)||15),expiresAfterMonths:Math.max(1,money(req.body.preBooking.expiresAfterMonths)||2)};
+  if(req.body.paymentWindow&&typeof req.body.paymentWindow==='object')m.paymentWindow={startDay:Math.min(28,Math.max(1,money(req.body.paymentWindow.startDay)||1)),endDay:Math.min(28,Math.max(1,money(req.body.paymentWindow.endDay)||5))};
+  if(req.body.referral&&typeof req.body.referral==='object'){const r=req.body.referral;const offerType=['free-press','percentage','fixed'].includes(String(r.offerType||''))?String(r.offerType):'free-press';m.referral={enabled:Boolean(r.enabled),code:String(r.code||defaultMenu.referral.code).trim().toUpperCase().slice(0,30),title:String(r.title||defaultMenu.referral.title).slice(0,100),description:String(r.description||defaultMenu.referral.description).slice(0,500),offerType,value:Math.max(0,money(r.value)),service:'laundry-free',expiresAt:r.expiresAt?String(r.expiresAt).slice(0,30):'',oneUsePerCustomer:r.oneUsePerCustomer!==false};}
+  if(req.body.serviceAddresses&&typeof req.body.serviceAddresses==='object')m.serviceAddresses={tiffin:String(req.body.serviceAddresses.tiffin||defaultMenu.serviceAddresses.tiffin).trim(),press:String(req.body.serviceAddresses.press||defaultMenu.serviceAddresses.press).trim()};
+  if(Array.isArray(req.body.rulesBook))m.rulesBook=req.body.rulesBook.map(x=>String(x).trim()).filter(Boolean).slice(0,50);
+  if(Array.isArray(req.body.daily)){
+    m.daily=req.body.daily.map((x,i)=>{const fallback=defaultMenu.daily[i]||defaultMenu.daily[0];return {key:x.key||fallback.key,label:String(x.label||fallback.label),price:Math.max(0,money(x.price)),description:String(x.description||''),items:Array.isArray(x.items)?x.items.map(v=>String(v).trim()).filter(Boolean):fallback.items}})
+  }
+  if(req.body.weekly && typeof req.body.weekly==='object'){m.weekly=req.body.weekly;m.markModified('weekly')}
+  if(req.body.party && typeof req.body.party==='object'){
+    const incoming=req.body.party;
+    m.party={
+      ...defaultMenu.party,
+      ...incoming,
+      pricePerPlate:Math.max(0,money(incoming.pricePerPlate)),
+      minGuests:Math.max(1,money(incoming.minGuests)||1),
+      packages:Array.isArray(incoming.packages)&&incoming.packages.length?incoming.packages.filter(x=>x?.id==='standard'||x?.id==='premium').map((x,i)=>({id:String(x.id),name:String(x.name||`Package ${i+1}`),description:String(x.description||''),price:Math.max(0,money(x.price)),menu:x.menu&&typeof x.menu==='object'?x.menu:{starters:JSON.parse(JSON.stringify(defaultMenu.party.starters)),mainCourse:JSON.parse(JSON.stringify(defaultMenu.party.mainCourse)),breadsRice:JSON.parse(JSON.stringify(defaultMenu.party.breadsRice)),desserts:JSON.parse(JSON.stringify(defaultMenu.party.desserts)),drinks:JSON.parse(JSON.stringify(defaultMenu.party.drinks))}})):defaultMenu.party.packages,
+      starters:Array.isArray(incoming.starters)?incoming.starters:defaultMenu.party.starters,
+      mainCourse:Array.isArray(incoming.mainCourse)?incoming.mainCourse:defaultMenu.party.mainCourse,
+      breadsRice:Array.isArray(incoming.breadsRice)?incoming.breadsRice:defaultMenu.party.breadsRice,
+      desserts:Array.isArray(incoming.desserts)?incoming.desserts:defaultMenu.party.desserts,
+      drinks:Array.isArray(incoming.drinks)?incoming.drinks:defaultMenu.party.drinks
+    };
+    for(const group of ['starters','mainCourse','breadsRice','desserts','drinks'])m.party[group]=m.party[group].map((x,i)=>({id:String(x.id||`${group}-${i+1}`),name:String(x.name||`Item ${i+1}`),pricePerPlate:Math.max(0,money(x.pricePerPlate))}));
+    m.markModified('party')
+  }
+  await m.save();res.json(m.toObject())
+}catch(e){next(e)}})
+app.put('/api/admin/bookings/:orderId/pause',auth,adminOnly,async(req,res,next)=>{try{const b=await Order.findOne({orderId:req.params.orderId});if(!b)return res.status(404).json({message:'Booking not found.'});const action=String(req.body?.action||'');const idx=Number(req.body?.index);if(!Number.isInteger(idx)||!b.pauseRequests?.[idx])return res.status(400).json({message:'Pause request not found.'});const r=b.pauseRequests[idx];if(action==='approve'){r.status='approved';r.approvedAt=new Date();b.servicePaused=true;b.servicePauseStart=r.startDate;b.servicePauseEnd=r.endDate;}else if(action==='reject'){r.status='rejected';r.rejectedAt=new Date();const active=(b.pauseRequests||[]).some((x,i)=>i!==idx&&x.status==='approved');if(!active){b.servicePaused=false;b.servicePauseStart='';b.servicePauseEnd='';}}else return res.status(400).json({message:'Invalid pause action.'});b.markModified('pauseRequests');await b.save();res.json(b)}catch(e){next(e)}})
+app.put('/api/admin/laundry',auth,adminOnly,async(req,res,next)=>{try{const x=await Laundry.findOne({key:'main'});if(!x)return res.status(503).json({message:'Laundry pricing not initialized.'});x.items=(req.body.items||[]).map(i=>({...i,prices:{wash:money(i.prices?.wash),press:money(i.prices?.press),'wash-press':money(i.prices?.['wash-press'])}}));await x.save();res.json(x.items)}catch(e){next(e)}})
+app.get('/api/admin/users',auth,adminOnly,async(_,res,next)=>{try{const rows=await User.find().select('name email phone address city pincode role createdAt').sort({createdAt:-1}).lean();res.json(rows.map(u=>({...u,id:String(u._id)})))}catch(e){next(e)}})
+app.put('/api/admin/users/:id/role',auth,adminOnly,async(req,res,next)=>{try{if(!['customer','admin'].includes(req.body?.role))return res.status(400).json({message:'Invalid role.'});const u=await User.findByIdAndUpdate(req.params.id,{role:req.body.role},{new:true,runValidators:true});if(!u)return res.status(404).json({message:'User not found.'});res.json(safeUser(u))}catch(e){next(e)}})
+app.delete('/api/admin/users/:id',auth,adminOnly,async(req,res,next)=>{try{if(String(req.user.id)===String(req.params.id))return res.status(400).json({message:'You cannot remove the admin account you are currently using.'});const u=await User.findById(req.params.id);if(!u)return res.status(404).json({message:'User not found.'});if(u.role==='admin')return res.status(400).json({message:'Admin accounts cannot be removed from the customer panel.'});await Promise.all([Order.deleteMany({userId:u._id}),Review.deleteMany({userId:u._id}),Feedback.deleteMany({userId:u._id})]);await u.deleteOne();res.json({message:'Customer removed successfully.',id:String(req.params.id)})}catch(e){next(e)}})
+
+app.get('/api/admin/delivery-partners',auth,adminOnly,async(_,res,next)=>{try{const rows=await DeliveryPartner.find().select('partnerId name phone active createdAt').sort({createdAt:1}).lean();res.json(rows.map(x=>({...x,id:String(x._id)})))}catch(e){next(e)}})
+app.post('/api/admin/delivery-partners',auth,adminOnly,async(req,res,next)=>{try{const name=String(req.body?.name||'Delivery Partner').trim();const phone=String(req.body?.phone||'').trim();let partnerId=String(req.body?.partnerId||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'');if(!partnerId){partnerId=`TWDEL${Math.floor(1000+Math.random()*9000)}`;while(await DeliveryPartner.exists({partnerId}))partnerId=`TWDEL${Math.floor(1000+Math.random()*9000)}`}if(await DeliveryPartner.exists({partnerId}))return res.status(409).json({message:'That delivery partner ID already exists.'});const password=String(req.body?.password||`Del@${crypto.randomBytes(4).toString('hex')}`).trim();if(password.length<6)return res.status(400).json({message:'Password must be at least 6 characters.'});const p=await DeliveryPartner.create({partnerId,name,phone,passwordHash:await bcrypt.hash(password,10),createdBy:req.user.email});const assigned=await autoAssignSingleUnassigned();res.status(201).json({id:String(p._id),partnerId:p.partnerId,name:p.name,phone:p.phone,password,autoAssigned:assigned})}catch(e){next(e)}})
+app.put('/api/admin/delivery-partners/:id',auth,adminOnly,async(req,res,next)=>{try{const p=await DeliveryPartner.findById(req.params.id);if(!p)return res.status(404).json({message:'Delivery partner not found.'});if(req.body.name!==undefined)p.name=String(req.body.name).trim();if(req.body.phone!==undefined)p.phone=String(req.body.phone).trim();if(req.body.active!==undefined)p.active=Boolean(req.body.active);if(req.body.password){p.passwordHash=await bcrypt.hash(String(req.body.password),10)}p.createdBy=req.user.email;await p.save();if(!p.active)await Order.updateMany({deliveryPartnerId:p.partnerId,deliveryStatus:{$ne:'delivered'}},{$set:{deliveryPartnerId:'',deliveryAssignedAt:null,deliveryStatus:'unassigned'}});const autoAssigned=await autoAssignSingleUnassigned();res.json({id:String(p._id),partnerId:p.partnerId,name:p.name,phone:p.phone,active:p.active,autoAssigned})}catch(e){next(e)}})
+app.post('/api/admin/delivery-partners/:id/reset-password',auth,adminOnly,async(req,res,next)=>{try{const p=await DeliveryPartner.findById(req.params.id);if(!p)return res.status(404).json({message:'Delivery partner not found.'});const password=String(req.body?.password||`Del@${crypto.randomBytes(5).toString('hex')}`).trim();if(password.length<6)return res.status(400).json({message:'Password must be at least 6 characters.'});p.passwordHash=await bcrypt.hash(password,10);p.active=true;p.createdBy=req.user.email;await p.save();res.json({id:String(p._id),partnerId:p.partnerId,name:p.name,phone:p.phone,password,message:'Delivery partner password reset successfully. Share this password with the partner.'})}catch(e){next(e)}})
+app.delete('/api/admin/delivery-partners/:id',auth,adminOnly,async(req,res,next)=>{try{const p=await DeliveryPartner.findById(req.params.id);if(!p)return res.status(404).json({message:'Delivery partner not found.'});await Order.updateMany({deliveryPartnerId:p.partnerId,deliveryStatus:{$ne:'delivered'}},{$set:{deliveryPartnerId:'',deliveryAssignedAt:null,deliveryStatus:'unassigned'}});await p.deleteOne();await autoAssignSingleUnassigned();res.json({message:'Delivery partner deleted and assigned deliveries released.',id:String(req.params.id)})}catch(e){next(e)}})
+app.get('/api/admin/delivery-settings',auth,adminOnly,async(_,res,next)=>{try{const m=await Menu.findOne({key:'main'}).lean();res.json(m?.deliverySettings||{autoAssignSingle:true})}catch(e){next(e)}})
+app.put('/api/admin/delivery-settings',auth,adminOnly,async(req,res,next)=>{try{const m=await Menu.findOne({key:'main'});if(!m)return res.status(503).json({message:'Menu not initialized.'});m.deliverySettings={...(m.deliverySettings||{}),autoAssignSingle:req.body?.autoAssignSingle!==false};m.markModified('deliverySettings');await m.save();const assigned=await autoAssignSingleUnassigned();res.json({...m.deliverySettings,assigned})}catch(e){next(e)}})
+app.post('/api/admin/delivery/auto-divide',auth,adminOnly,async(_,res,next)=>{try{const partners=await DeliveryPartner.find({active:true}).select('partnerId').sort({createdAt:1}).lean();if(!partners.length)return res.status(400).json({message:'Create at least one active delivery partner first.'});const orders=await Order.find({service:{$in:['monthly-tiffin','laundry','additional-food']},paymentStatus:'paid',deliveryPartnerId:{$in:['',null]},deliveryStatus:{$in:['unassigned','']}}).sort({date:1,pickupDate:1,createdAt:1}).lean();for(let i=0;i<orders.length;i++){await Order.updateOne({_id:orders[i]._id},{$set:{deliveryPartnerId:partners[i%partners.length].partnerId,deliveryAssignedAt:new Date(),deliveryStatus:'assigned'}})}res.json({assigned:orders.length,partners:partners.length,message:orders.length?`Divided ${orders.length} deliveries among ${partners.length} active partners.`:'No unassigned paid deliveries to divide.'})}catch(e){next(e)}})
+app.put('/api/admin/bookings/:orderId/delivery',auth,adminOnly,async(req,res,next)=>{try{const b=await Order.findOne({orderId:req.params.orderId});if(!b)return res.status(404).json({message:'Order not found.'});if(!['monthly-tiffin','laundry','additional-food'].includes(b.service))return res.status(400).json({message:'Delivery partners can only receive Tiffin, Additional Food and Press Wallah orders.'});if(b.paymentStatus!=='paid')return res.status(400).json({message:'Only paid orders can be assigned to a delivery partner.'});if(b.status==='delivered'||b.deliveryStatus==='delivered')return res.status(400).json({message:'A completed delivery cannot be reassigned.'});const partnerId=String(req.body?.partnerId||'').trim().toUpperCase();if(!partnerId){b.deliveryPartnerId='';b.deliveryAssignedAt=null;b.deliveryStatus='unassigned';await b.save();return res.json(b)}const p=await DeliveryPartner.findOne({partnerId,active:true});if(!p)return res.status(404).json({message:'Active delivery partner not found.'});b.deliveryPartnerId=p.partnerId;b.deliveryAssignedAt=new Date();b.deliveryStatus='assigned';await b.save();res.json(b)}catch(e){next(e)}})
+app.get('/api/delivery/orders',auth,deliveryOnly,async(req,res,next)=>{try{const rows=await Order.find({deliveryPartnerId:req.user.partnerId,service:{$in:['monthly-tiffin','laundry','additional-food']},paymentStatus:'paid'}).populate('userId','name email phone address city pincode').sort({createdAt:1}).lean();res.json(rows)}catch(e){next(e)}})
+app.put('/api/delivery/orders/:orderId/status',auth,deliveryOnly,async(req,res,next)=>{try{const allowed=['assigned','out-for-delivery','delivered'];const status=String(req.body?.status||'');if(!allowed.includes(status))return res.status(400).json({message:'Invalid delivery status.'});const b=await Order.findOne({orderId:req.params.orderId,deliveryPartnerId:req.user.partnerId,service:{$in:['monthly-tiffin','laundry','additional-food']}});if(!b)return res.status(404).json({message:'Assigned delivery not found.'});b.deliveryStatus=status;if(status==='out-for-delivery')b.status='out-for-delivery';if(status==='delivered')b.status='delivered';await b.save();res.json(b)}catch(e){next(e)}})
+
+app.get('/api/reviews',async(_,res,next)=>{try{res.json(await Review.find().sort({createdAt:-1}).lean())}catch(e){next(e)}})
+app.post('/api/reviews',auth,async(req,res,next)=>{try{const rating=Number(req.body?.rating);const comment=String(req.body?.comment||'').trim();const service=['tiffin','party','laundry'].includes(req.body?.service)?req.body.service:'tiffin';if(!Number.isInteger(rating)||rating<1||rating>5)return res.status(400).json({message:'Choose a rating from 1 to 5.'});if(comment.length<3)return res.status(400).json({message:'Please write at least 3 characters in your review.'});if(comment.length>1000)return res.status(400).json({message:'Review must be 1000 characters or less.'});const u=await User.findById(req.user.id);if(!u)return res.status(401).json({message:'Your account session is no longer valid. Please login again.'});const verified=!!await Order.exists({userId:u._id,paymentStatus:'paid',service:service==='tiffin'?{$in:['daily-tiffin','monthly-tiffin']}:service});const r=await Review.create({userId:u._id,name:u.name,service,rating,comment,verified});res.status(201).json(r)}catch(e){next(e)}})
+app.post('/api/feedback',auth,async(req,res,next)=>{try{const u=await User.findById(req.user.id);const message=String(req.body?.message||'').trim();if(!message)return res.status(400).json({message:'Please enter your feedback.'});if(message.length>1000)return res.status(400).json({message:'Feedback must be 1000 characters or less.'});const f=await Feedback.create({userId:u._id,name:u.name,email:u.email,type:req.body?.type||'suggestion',orderId:String(req.body?.orderId||'').trim(),message});res.status(201).json(f)}catch(e){next(e)}})
+app.get('/api/feedback',auth,adminOnly,async(_,res,next)=>{try{res.json(await Feedback.find().sort({createdAt:-1}).lean())}catch(e){next(e)}})
+app.get('/api/admin/reviews',auth,adminOnly,async(_,res,next)=>{try{res.json(await Review.find().populate('userId','name email').sort({createdAt:-1}).lean())}catch(e){next(e)}})
+app.put('/api/admin/reviews/:id',auth,adminOnly,async(req,res,next)=>{try{const rating=Number(req.body?.rating);const comment=String(req.body?.comment||'').trim();const service=['tiffin','party','laundry'].includes(req.body?.service)?req.body.service:'tiffin';if(!Number.isInteger(rating)||rating<1||rating>5)return res.status(400).json({message:'Choose a rating from 1 to 5.'});if(comment.length<3||comment.length>1000)return res.status(400).json({message:'Review must be between 3 and 1000 characters.'});const r=await Review.findByIdAndUpdate(req.params.id,{rating,comment,service},{new:true,runValidators:true}).populate('userId','name email');if(!r)return res.status(404).json({message:'Review not found.'});res.json(r)}catch(e){next(e)}})
+app.post('/api/admin/notifications/unpaid',auth,adminOnly,async(_,res,next)=>{try{const transport=mailer();if(!transport)return res.status(503).json({message:'Email notifications are not configured. Add SMTP_HOST, SMTP_USER and SMTP_PASS to server/.env.'});const pending=await Order.find({paymentStatus:{$ne:'paid'},status:{$nin:['cancelled','delivered']}}).populate('userId','name email');const unique=new Map();for(const o of pending){const email=o.userId?.email;if(email&&!unique.has(email))unique.set(email,{name:o.userId.name,email,orders:[]});if(email)unique.get(email).orders.push(o)}const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));let sent=0;for(const customer of unique.values()){const orderLines=customer.orders.map(o=>`• ${o.orderId} — ₹${Number(o.total||0).toLocaleString('en-IN')} — ${o.service}`).join('\n');const htmlOrders=customer.orders.map(o=>{const payUrl=`${PUBLIC_APP_URL}/account?tab=orders&pay=${encodeURIComponent(o.orderId)}`;return `<div style=\"margin:0 0 18px;padding:16px 18px;border:1px solid #dfe4ec;border-radius:12px;background:#ffffff;\"><div style=\"font-weight:700;font-size:16px;color:#101828;\">${esc(o.orderId)}</div><div style=\"margin-top:6px;color:#667085;\">${esc(o.service)} · <strong style=\"color:#101828;\">₹${Number(o.total||0).toLocaleString('en-IN')}</strong></div><a href=\"${esc(payUrl)}\" style=\"display:inline-block;margin-top:14px;padding:11px 18px;background:#0d1b3e;color:#ffffff;text-decoration:none;border-radius:7px;font-weight:700;\">Pay Now</a><div style=\"margin-top:10px;font-size:12px;color:#667085;word-break:break-all;\">Payment link: ${esc(payUrl)}</div></div>`}).join('');const subject=customer.orders.length===1?`Payment Reminder | Tiffin Wallah | ${customer.orders[0].orderId}`:'Payment Reminder | Tiffin Wallah';const payText=customer.orders.map(o=>`${o.orderId} — ₹${Number(o.total||0).toLocaleString('en-IN')} — ${o.service}\nPay securely: ${PUBLIC_APP_URL}/account?tab=orders&pay=${encodeURIComponent(o.orderId)}`).join('\n\n');const text=`Dear ${customer.name||'Customer'},\n\nThis is a formal reminder from Tiffin Wallah regarding your pending payment.\n\nOur records show that the following order(s) are awaiting payment:\n\n${orderLines}\n\nPlease complete the payment at your earliest convenience so that we can confirm your order and allocate the requested service. Your order will remain pending until the payment is successfully verified.\n\nPAYMENT LINK\n${payText}\n\nIf you have already completed the payment, please disregard this message. If the payment was completed but your order still shows as pending, open your account and use the Check Payment option.\n\nFor any assistance, please contact Tiffin Wallah support.\n\nRegards,\nTiffin Wallah\nFresh food. Made with care. Delivered on time.`;const html=`<div style=\"font-family:Arial,Helvetica,sans-serif;background:#f5f7fa;padding:32px 16px;color:#101828;\"><div style=\"max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e4e7ec;border-radius:16px;overflow:hidden;\"><div style=\"background:#0d1b3e;padding:24px 28px;color:#ffffff;\"><div style=\"font-size:12px;letter-spacing:2px;font-weight:700;\">TIFFIN WALLAH</div><h1 style=\"margin:10px 0 0;font-size:28px;\">Payment Reminder</h1></div><div style=\"padding:28px;\"><p style=\"font-size:16px;\">Dear ${esc(customer.name||'Customer')},</p><p style=\"line-height:1.6;color:#475467;\">This is a formal reminder regarding your pending Tiffin Wallah payment. Our records show that the following order(s) are awaiting payment.</p>${htmlOrders}<p style=\"line-height:1.6;color:#475467;\">Please complete the payment at your earliest convenience so that we can confirm your order and allocate the requested service. Your order will remain pending until the payment is successfully verified.</p><p style=\"line-height:1.6;color:#475467;\">If you have already completed the payment, please disregard this message. If your payment was completed but the order still shows as pending, open your account and use <strong>Check Payment</strong>.</p><p style=\"margin-top:28px;line-height:1.6;color:#475467;\">For any assistance, please contact Tiffin Wallah support.</p><p style=\"margin-bottom:0;\">Regards,<br><strong>Tiffin Wallah</strong><br><span style=\"color:#667085;\">Fresh food. Made with care. Delivered on time.</span></p></div></div></div>`;await transport.sendMail({from:process.env.SMTP_FROM||process.env.SMTP_USER,to:customer.email,subject,text,html});sent++}res.json({message:`Formal payment reminder sent to ${sent} customer${sent===1?'':'s'}. Each reminder includes a Pay Now link.`,sent,pendingOrders:pending.length})}catch(e){next(e)}})
+
+// Date-specific menu overrides; legacy weekly menus remain the fallback.
+app.get('/api/menu/schedule',async(req,res,next)=>{try{
+  const from=String(req.query.from||'').slice(0,10),to=String(req.query.to||'').slice(0,10)
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(from)||!/^\d{4}-\d{2}-\d{2}$/.test(to)||to<from)return res.status(400).json({message:'Valid from/to dates required'})
+  const rows=await MenuSchedule.find({date:{$gte:from,$lte:to},enabled:true}).sort({date:1}).limit(124).lean()
+  res.json(rows)
+}catch(e){next(e)}})
+app.put('/api/admin/menu/schedule',auth,adminOnly,async(req,res,next)=>{try{
+  const {date,plan,meals,enabled=true}=req.body||{}
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(String(date))||!Number.isFinite(Date.parse(date+'T00:00:00Z'))||!['standard','premium'].includes(plan)||!meals||typeof meals!=='object'||Array.isArray(meals))return res.status(400).json({message:'Valid date, plan and meals are required'})
+  const cleaned={};for(const slot of ['morning','lunch','dinner'])if(meals[slot]?.name){cleaned[slot]={name:String(meals[slot].name).trim().slice(0,160)}}
+  if(!Object.keys(cleaned).length)return res.status(400).json({message:'At least one meal is required'})
+  const result=await MenuSchedule.findOneAndUpdate({date,plan},{$set:{meals:cleaned,enabled:enabled===true}},{upsert:true,new:true,runValidators:true})
+  res.json(result)
+}catch(e){next(e)}})
+app.get('/api/subscriptions/calendar',auth,async(req,res,next)=>{try{
+  const month=String(req.query.month||new Date().toISOString().slice(0,7))
+  if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month))return res.status(400).json({message:'Invalid month'})
+  const start=month+'-01',end=new Date(Date.UTC(Number(month.slice(0,4)),Number(month.slice(5,7)),0)).toISOString().slice(0,10)
+  const orders=await Order.find({userId:req.user.id,service:'monthly-tiffin',paymentStatus:'paid'}).select('orderId date plan status pauseRequests servicePaused servicePauseStart servicePauseEnd createdAt').lean()
+  const days=[];for(let n=1;n<=Number(end.slice(8));n++){
+    const date=month+'-'+String(n).padStart(2,'0')
+    const meals=orders.filter(o=>{const begin=o.date||o.createdAt?.toISOString().slice(0,10);if(!begin||date<begin)return false;const until=new Date(begin+'T00:00:00Z');until.setUTCDate(until.getUTCDate()+29);return date<=until.toISOString().slice(0,10)}).map(o=>({orderId:o.orderId,plan:o.plan,status:(o.pauseRequests||[]).some(r=>r.status==='approved'&&date>=r.startDate&&date<=r.endDate)?'paused':o.status==='delivered'?'delivered':'scheduled'}))
+    days.push({date,meals})
+  }
+  res.json({month,days,notice:'Calendar uses a 30-day subscription window; individual daily delivery confirmations require separate meal records.'})
+}catch(e){next(e)}})
+app.get('/api/admin/orders/live',auth,adminOnly,async(req,res,next)=>{try{
+  const page=Math.min(10000,Math.max(1,Number.parseInt(req.query.page,10)||1)),limit=30
+  const status=String(req.query.status||'');const filter=status?{status:{$in:['awaiting-payment','confirmed','preparing','packed','out-for-delivery','delivered','cancelled'].includes(status)?[status]:[]}}:{}
+  const [orders,total]=await Promise.all([Order.find(filter).select('orderId service plan status paymentStatus total date createdAt deliveryStatus userId').sort({createdAt:-1}).skip((page-1)*limit).limit(limit).populate('userId','name phone').lean(),Order.countDocuments(filter)])
+  res.json({orders,total,page,pages:Math.ceil(total/limit)})
+}catch(e){next(e)}})
+
+const certificatePayload = body => {
+ const x={};for(const k of ['title','category','issuer','licenseNumber','validUntil','description','documentUrl'])x[k]=String(body?.[k]??'').trim();
+ x.published=body?.published===true;
+ if(!x.title||!x.issuer||!x.category)return {error:'Title, category and issuing authority are required.'};
+ if(!/^https:\/\/[^\s]+$/i.test(x.documentUrl))return {error:'A valid HTTPS certificate URL is required.'};
+ try{const u=new URL(x.documentUrl);if(u.username||u.password||['localhost','127.0.0.1','::1'].includes(u.hostname)||!u.hostname.includes('.'))return {error:'Invalid public certificate URL.'}}catch{return {error:'Invalid certificate URL.'}}
+ if(x.validUntil&&!/^\d{4}-\d{2}-\d{2}$/.test(x.validUntil))return {error:'Invalid expiry date.'};
+ return {value:x};
+};
+app.get('/api/certificates',async(req,res,next)=>{try{res.json(await Certificate.find({published:true}).sort({createdAt:-1}).lean())}catch(e){next(e)}})
+app.get('/api/admin/certificates',auth,adminOnly,async(req,res,next)=>{try{res.json(await Certificate.find().sort({createdAt:-1}).lean())}catch(e){next(e)}})
+app.post('/api/admin/certificates',auth,adminOnly,async(req,res,next)=>{try{const p=certificatePayload(req.body);if(p.error)return res.status(400).json({message:p.error});res.status(201).json(await Certificate.create(p.value))}catch(e){next(e)}})
+app.put('/api/admin/certificates/:id',auth,adminOnly,async(req,res,next)=>{try{if(!mongoose.isValidObjectId(req.params.id))return res.status(400).json({message:'Invalid certificate ID.'});const p=certificatePayload(req.body);if(p.error)return res.status(400).json({message:p.error});const doc=await Certificate.findByIdAndUpdate(req.params.id,p.value,{new:true,runValidators:true});if(!doc)return res.status(404).json({message:'Certificate not found.'});res.json(doc)}catch(e){next(e)}})
+app.delete('/api/admin/certificates/:id',auth,adminOnly,async(req,res,next)=>{try{if(!mongoose.isValidObjectId(req.params.id))return res.status(400).json({message:'Invalid certificate ID.'});const doc=await Certificate.findByIdAndDelete(req.params.id);if(!doc)return res.status(404).json({message:'Certificate not found.'});res.json({message:'Certificate deleted.'})}catch(e){next(e)}})
+
+app.use((err,req,res,_next)=>{if(err?.message==='CORS origin is not allowed.')return res.status(403).json({message:'This website origin is not allowed to access the API.'});console.error(`[API] ${req.method} ${req.path}`,err);if(err?.code===11000)return res.status(409).json({message:'This record already exists.'});if(err?.type==='entity.too.large')return res.status(413).json({message:'Request payload too large.'});if(err instanceof SyntaxError && err.status===400 && 'body' in err)return res.status(400).json({message:'Invalid JSON request.'});if(err?.name==='ValidationError')return res.status(400).json({message:Object.values(err.errors).map(x=>x.message).join(', ')});res.status(500).json({message:process.env.NODE_ENV==='production'?'Server error. Please try again.':err.message||'Server error.'})})
+
+async function start(){
+  if(!MONGODB_URI){console.error('MONGODB_URI is missing. Create server/.env from .env.example and add your MongoDB URI.');process.exit(1)}
+  mongoose.set('strictQuery',true)
+  mongoose.connection.on('connected',()=>console.log('MongoDB connected successfully.'))
+  mongoose.connection.on('error',e=>console.error('MongoDB error:',e.message))
+  try{await mongoose.connect(MONGODB_URI,{serverSelectionTimeoutMS:10000,connectTimeoutMS:10000,maxPoolSize:10});await ensureDefaults();app.listen(PORT,()=>console.log(`Tiffin Wallah API running on http://localhost:${PORT}`))}catch(e){console.error('\nMongoDB connection failed.');console.error(e.message)
+    console.error('MongoDB DNS servers:', mongoDnsServers.join(', '))
+    console.error('Check Atlas Network Access, database user/password, and internet access.')
+    process.exit(1)}
+}
+start()
